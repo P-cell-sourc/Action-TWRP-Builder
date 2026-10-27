@@ -61,7 +61,7 @@ jobs:
         echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
         echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
         echo "::endgroup::"
- 
+
     # You might want to Checkout your repo first, but not mandatory
     - name: Check Out
       uses: actions/checkout@v3
@@ -102,7 +102,7 @@ jobs:
       # repo 工具自身改用清华镜像
       env:
         REPO_URL: 'https://mirrors.tuna.tsinghua.edu.cn/git/git-repo'
-      
+
     - name: Initialize repo
       run: |
         mkdir workspace
@@ -112,12 +112,12 @@ jobs:
         git config --global user.email "b170420nc@gmail.com"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
       id: pwd
-          
+
     - name: Repo Sync
       run: |
         repo sync -j$(nproc --all) --force-sync
       working-directory: workspace
-      
+
     - name: Clone device tree
       run: |
         git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
@@ -131,11 +131,13 @@ jobs:
         git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
+    # 修改点 1：只要 manifest 分支以 twrp 开头（含 twrp-14 / twrp-14.1），
+    # 依赖文件就按 twrp.dependencies 解析，不再只匹配 11/12.1
     - name: Check Build Tree
       uses: haya14busa/action-cond@v1
       id: buildtree
       with:
-        cond: ${{ github.event.inputs.MANIFEST_BRANCH == 'twrp-11' || github.event.inputs.MANIFEST_BRANCH == 'twrp-12.1' }}
+        cond: ${{ startsWith(github.event.inputs.MANIFEST_BRANCH, 'twrp') }}
         if_true: twrp
         if_false: omni
 
@@ -151,17 +153,32 @@ jobs:
       with:
         swap-size-gb: 12
 
+    # 修改点 2：Android 14+ 的 lunch 必须是三段式 <product>-<release>-<variant>
+    # 这里自动探测可用的 release 段，兼容 11/12.1（两段式）和 14/14.1（三段式）
     - name: Building recovery
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        LUNCH_OK=""
+        for rel in "-eng" "-ap2a-eng" "-ap3a-eng" "-ap4a-eng" "-bp1a-eng"; do
+          if lunch "${{ github.event.inputs.MAKEFILE_NAME }}${rel}" >/dev/null 2>&1; then
+            LUNCH_OK="${{ github.event.inputs.MAKEFILE_NAME }}${rel}"
+            break
+          fi
+        done
+        if [ -z "$LUNCH_OK" ]; then
+          echo "::error::没有找到可用的 lunch combo，请检查 MAKEFILE_NAME 是否与设备树中的产品名一致"
+          exit 1
+        fi
+        echo "Using lunch target: $LUNCH_OK"
+        make clean
+        make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       with:
-        files: | 
+        files: |
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
