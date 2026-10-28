@@ -154,20 +154,43 @@ jobs:
         swap-size-gb: 12
 
     # 修改点 2：Android 14+ 的 lunch 必须是三段式 <product>-<release>-<variant>
-    # 这里自动探测可用的 release 段，兼容 11/12.1（两段式）和 14/14.1（三段式）
+    # 这里直接枚举源码里实际存在的 release 配置逐个尝试，兼容所有 14/15/16 分支；
+    # 全部失败时打印真实报错，方便定位
     - name: Building recovery
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
+        MAKEFILE_NAME="${{ github.event.inputs.MAKEFILE_NAME }}"
+
+        # 枚举 build/release/release_configs 下实际存在的 release 配置名
+        RELS=""
+        if [ -d build/release/release_configs ]; then
+          RELS=$(ls build/release/release_configs | sed 's/\.[^.]*$//' | sort -u)
+        fi
+        echo "源码中可用的 release 配置: $RELS"
+
+        try_lunch() { lunch "$1" >/dev/null 2>&1; }
+
         LUNCH_OK=""
-        for rel in "-eng" "-ap2a-eng" "-ap3a-eng" "-ap4a-eng" "-bp1a-eng"; do
-          if lunch "${{ github.event.inputs.MAKEFILE_NAME }}${rel}" >/dev/null 2>&1; then
-            LUNCH_OK="${{ github.event.inputs.MAKEFILE_NAME }}${rel}"
-            break
-          fi
-        done
+        # 先试旧版两段式（twrp-11/12.1）
+        if try_lunch "${MAKEFILE_NAME}-eng"; then
+          LUNCH_OK="${MAKEFILE_NAME}-eng"
+        else
+          # 已知常见 release 段优先尝试
+          for rel in ap2a ap3a ap4a ap5a bp1a bp2a bxi dx1 $RELS; do
+            if try_lunch "${MAKEFILE_NAME}-${rel}-eng"; then
+              LUNCH_OK="${MAKEFILE_NAME}-${rel}-eng"
+              break
+            fi
+          done
+        fi
+
         if [ -z "$LUNCH_OK" ]; then
-          echo "::error::没有找到可用的 lunch combo，请检查 MAKEFILE_NAME 是否与设备树中的产品名一致"
+          echo "::error::自动探测失败，下面打印真实报错用于排查"
+          echo "===== 旧版格式完整输出 ====="
+          lunch "${MAKEFILE_NAME}-eng" || true
+          echo "===== 三段式(ap2a)完整输出 ====="
+          lunch "${MAKEFILE_NAME}-ap2a-eng" || true
           exit 1
         fi
         echo "Using lunch target: $LUNCH_OK"
