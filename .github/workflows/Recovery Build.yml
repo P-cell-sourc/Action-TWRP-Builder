@@ -6,23 +6,23 @@ on:
       MANIFEST_URL:
         description: 'MANIFEST_URL (if want to use SSH keys, use git@github.com:XXXXX)'
         required: true
-        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
+        default: 'https://github.com/TWRP-Test/platform_manifest_twrp_aosp'
       MANIFEST_BRANCH:
         description: 'MANIFEST_BRANCH'
         required: true
-        default: 'twrp-12.1'
+        default: 'twrp-16.0'
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
-        default: 'https://github.com/TeamWin/android_device_asus_I003D'
+        default: 'https://github.com/P-cell-sourc/twrp_device_vivo_PD2415'
       DEVICE_TREE_BRANCH:
         description: 'DEVICE_TREE_BRANCH'
         required: true
-        default: 'android-12.1'
+        default: 'main'
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
-        default: 'device/asus/I003D'
+        default: 'device/vivo/PD2415'
       COMMON_TREE_URL:
         description: 'COMMON_TREE_URL (if no common tree, leave blank)'
         required: false
@@ -36,11 +36,11 @@ on:
       MAKEFILE_NAME:
         description: 'MAKEFILE_NAME'
         required: true
-        default: 'twrp_I003D'
+        default: 'twrp_PD2415'
       BUILD_TARGET:
         description: 'BUILD_TARGET'
         required: true
-        default: 'recovery'
+        default: 'vendorboot'
 
 jobs:
   build:
@@ -121,6 +121,62 @@ jobs:
     - name: Clone device tree
       run: |
         git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+        echo "===== 克隆下来的设备树内容 ====="
+        ls -la ./${{ github.event.inputs.DEVICE_PATH }}
+        if [ ! -f ./${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk ]; then
+          echo "::error::分支 ${{ github.event.inputs.DEVICE_TREE_BRANCH }} 里没有 AndroidProducts.mk！请检查 DEVICE_TREE_BRANCH 是否填对（例如 main）"
+          exit 1
+        fi
+        if ! grep -q "${{ github.event.inputs.MAKEFILE_NAME }}" ./${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk; then
+          echo "::error::AndroidProducts.mk 里没有注册产品 ${{ github.event.inputs.MAKEFILE_NAME }}，请核对 MAKEFILE_NAME 与设备树实际产品名"
+          cat ./${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk
+          exit 1
+        fi
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    # 修改点 4：自动修补 SebaUbuntu 旧生成器留下的过时配置
+    # 1) PRODUCT_STATIC_BOOT_CONTROL_HAL 在 Android 14+ 已废弃，会让设备树解析直接报错
+    # 2) 树内若未定义 bootctrl 模块却引用它，会导致后面模块缺失报错
+    - name: Patch device tree
+      run: |
+        D=./${{ github.event.inputs.DEVICE_PATH }}
+        if grep -rq "PRODUCT_STATIC_BOOT_CONTROL_HAL" $D --include="*.mk"; then
+          sed -i '/PRODUCT_STATIC_BOOT_CONTROL_HAL/,+4d' $D/device.mk
+          if grep -q "PRODUCT_STATIC_BOOT_CONTROL_HAL" $D/device.mk; then
+            echo "::error::自动删除 PRODUCT_STATIC_BOOT_CONTROL_HAL 失败，请手动编辑 device.mk"
+            exit 1
+          fi
+          echo "已移除过时的 PRODUCT_STATIC_BOOT_CONTROL_HAL"
+        fi
+        if grep -q "bootctrl" $D/device.mk && ! grep -rq "cc_library" $D --include="*.bp"; then
+          sed -i '/^PRODUCT_PACKAGES += \\$/{N;/bootctrl/d}' $D/device.mk
+          echo "树内未定义 bootctrl 模块，已移除其 PRODUCT_PACKAGES 引用"
+        fi
+        # 3) GKI 设备（recovery 在 vendor_boot 中）的 BoardConfig 修正：
+        #    核心：构建系统依据 BOARD_BOOT_HEADER_VERSION >= 3 判定会构建 vendor_boot 镜像。
+        #    SebaUbuntu 生成器写的 BOARD_BOOTIMG_HEADER_VERSION 是非官方变量名，不被识别，
+        #    因此必须补上官方变量 BOARD_BOOT_HEADER_VERSION，否则报
+        #    "Should not set BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT if not building vendor_boot image"
+        if grep -q "BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT" $D/BoardConfig.mk; then
+          if ! grep -q "^BOARD_BOOT_HEADER_VERSION *:=" $D/BoardConfig.mk; then
+            HV=$(sed -n 's/^BOARD_BOOTIMG_HEADER_VERSION *:= *\([0-9]*\).*/\1/p' $D/BoardConfig.mk | head -1)
+            HV=${HV:-4}
+            echo "BOARD_BOOT_HEADER_VERSION := $HV" >> $D/BoardConfig.mk
+            echo "已追加 BOARD_BOOT_HEADER_VERSION := $HV"
+          fi
+          sed -i 's/BOARD_VENDOR_BOOT_PARTITION_SIZE/BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE/g' $D/BoardConfig.mk
+          if ! grep -q "BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE" $D/BoardConfig.mk; then
+            echo 'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE := 134217728' >> $D/BoardConfig.mk
+            echo "已追加 BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE"
+          fi
+          # BOARD_USES_RECOVERY_AS_BOOT 与 MOVE_TO_VENDOR_BOOT 不能同时为 true
+          sed -i '/BOARD_USES_RECOVERY_AS_BOOT/d' $D/BoardConfig.mk
+          grep -q "BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT" $D/BoardConfig.mk || \
+            sed -i '/BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT/a BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true' $D/BoardConfig.mk
+          echo "已修正 GKI vendor_boot 相关 BoardConfig"
+        fi
+        echo "===== BoardConfig 修补结果验证 ====="
+        grep -nE "VENDOR_BOOT|RECOVERY_AS_BOOT|RECOVERY_RAMDISK" $D/BoardConfig.mk || true
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Clone common tree
@@ -148,10 +204,38 @@ jobs:
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
 
+    # 修改点 5：释放磁盘空间并监控，防止 runner 磁盘耗尽导致任务被平台取消
+    - name: Free disk space
+      run: |
+        echo "===== 清理前磁盘占用 ====="
+        df -h / || true
+        echo "===== .repo 元数据大小 ====="
+        du -sh .repo 2>/dev/null || true
+        # 编译不需要 git 元数据，删除可释放约 10-25GB
+        rm -rf .repo/projects .repo/project-objects .repo/manifests.git
+        echo "===== 清理后磁盘占用 ====="
+        df -h /
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
     - name: Set Swap Space
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 12
+
+    # 修改点 3：构建前打印设备树与产品注册情况，便于排查
+    # "Don't have a product spec for" = 源码扫描不到产品，此步骤可定位原因
+    - name: Debug product registration
+      run: |
+        echo "===== 设备树目录内容 ====="
+        ls -la ./${{ github.event.inputs.DEVICE_PATH }} || echo "!! 设备树目录不存在，检查 DEVICE_PATH 输入"
+        echo "===== AndroidProducts.mk 内容 ====="
+        cat ./${{ github.event.inputs.DEVICE_PATH }}/AndroidProducts.mk || echo "!! AndroidProducts.mk 不存在，检查 DEVICE_TREE_BRANCH 是否正确"
+        echo "===== vendor/twrp 是否存在 ====="
+        ls vendor/twrp/config/ || echo "!! 缺少 vendor/twrp（manifest 不完整）"
+        echo "===== lunch 菜单中注册的产品（搜索 PD2415）====="
+        source build/envsetup.sh
+        lunch </dev/null 2>&1 | grep -i pd2415 || echo "!! lunch 菜单中没有任何 PD2415 相关产品"
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     # 修改点 2：Android 14+ 的 lunch 必须是三段式 <product>-<release>-<variant>
     # 这里直接枚举源码里实际存在的 release 配置逐个尝试，兼容所有 14/15/16 分支；
@@ -176,8 +260,8 @@ jobs:
         if try_lunch "${MAKEFILE_NAME}-eng"; then
           LUNCH_OK="${MAKEFILE_NAME}-eng"
         else
-          # 已知常见 release 段优先尝试
-          for rel in ap2a ap3a ap4a ap5a bp1a bp2a bxi dx1 $RELS; do
+          # 已知常见 release 段优先尝试（新版本源优先）
+          for rel in bp2a bp1a ap4a ap3a ap2a $RELS; do
             if try_lunch "${MAKEFILE_NAME}-${rel}-eng"; then
               LUNCH_OK="${MAKEFILE_NAME}-${rel}-eng"
               break
@@ -187,6 +271,10 @@ jobs:
 
         if [ -z "$LUNCH_OK" ]; then
           echo "::error::自动探测失败，下面打印真实报错用于排查"
+          echo "===== device/ 顶层目录 ====="
+          ls device/ || true
+          echo "===== 源码中所有 AndroidProducts.mk ====="
+          find device -maxdepth 3 -name AndroidProducts.mk || true
           echo "===== 旧版格式完整输出 ====="
           lunch "${MAKEFILE_NAME}-eng" || true
           echo "===== 三段式(ap2a)完整输出 ====="
@@ -194,17 +282,27 @@ jobs:
           exit 1
         fi
         echo "Using lunch target: $LUNCH_OK"
+
+        # GKI 设备（recovery 资源打包进 vendor_boot）改用 vendorbootimage 目标
+        if grep -q "BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT := true" BoardConfig.mk; then
+          MAKE_TARGET="vendorbootimage"
+          echo "检测到 GKI 配置：编译目标改为 vendorbootimage（产出 vendor_boot.img）"
+        else
+          MAKE_TARGET="${{ github.event.inputs.BUILD_TARGET }}image"
+        fi
+        echo "===== 编译前磁盘/内存状态 ====="
+        df -h /
+        free -h || true
         make clean
-        make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        make $MAKE_TARGET -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
