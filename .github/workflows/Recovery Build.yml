@@ -505,9 +505,30 @@ jobs:
         fi
         echo "并行度：make -j${JOBS}"
 
+        # soong_build 是 Go 程序，堆会涨到存活对象的数倍；给一个软上限，
+        # 让它多做 GC 而不是一路涨到被内核 OOM（在低内存 runner 上很常见）。
+        if [ -z "${GOMEMLIMIT:-}" ]; then
+          export GOMEMLIMIT=$(( MEM_GB * 70 / 100 ))GiB
+          echo "GOMEMLIMIT=$GOMEMLIMIT"
+        fi
+
+        # 心跳：每 60s 打一行内存/磁盘。进程被外部杀掉时日志会突然截断，
+        # 有这条时间线就能看出是内存一路涨到顶，还是一直很平稳（外部原因）。
+        (
+          while :; do
+            sleep 60 || exit 0
+            printf '[heartbeat %s] ' "$(date -u +%H:%M:%S)"
+            awk '/MemAvailable/{printf "可用内存 %.1fGB ", $2/1024/1024}' /proc/meminfo
+            printf '剩余磁盘 %s\n' "$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9')GB"
+          done
+        ) &
+        HB=$!
+        stop_hb() { kill "$HB" 2>/dev/null || true; pkill -P "$HB" 2>/dev/null || true; }
+
         # 被 SIGTERM 杀掉时（exit 143）先记录现场，否则日志会断在半截、
         # 看不出是 OOM、超时还是 runner 被回收。
         on_term() {
+          stop_hb
           echo "::error::编译进程收到 SIGTERM（exit 143）——常见原因：任务被取消、超时、runner 被回收"
           echo "===== 内存 ====="; free -h || true
           echo "===== 磁盘 ====="; df -h . || true
@@ -522,6 +543,7 @@ jobs:
         RC=0
         make -j"$JOBS" "$MAKE_TARGET" 2>&1 | tee build.log || RC=${PIPESTATUS[0]}
         trap - TERM INT
+        stop_hb
         echo "make 退出码：$RC"
         exit "$RC"
 
