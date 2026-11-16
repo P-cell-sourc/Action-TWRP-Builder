@@ -344,7 +344,10 @@ jobs:
       id: build
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
-        set -uo pipefail
+        # 注意：这里不能用 set -u。AOSP 的 build/envsetup.sh 会引用未定义变量
+        # （如 $TOP），在 nounset 下会直接 `TOP: unbound variable` 退出。
+        set -o pipefail
+        set +u
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         export LC_ALL=C
