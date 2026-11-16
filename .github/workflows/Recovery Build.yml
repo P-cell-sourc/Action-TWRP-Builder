@@ -51,6 +51,10 @@ on:
         description: 'JAVA_VERSION（twrp-14.x 用 17；twrp-11 / twrp-12.1 用 11；Android 10 及更早用 8）'
         required: true
         default: '17'
+      BUILD_JOBS:
+        description: 'BUILD_JOBS（make -j 并发数，0 = 按内存自动：约每 4GB 内存 1 个并发）'
+        required: false
+        default: '0'
 
 concurrency:
   group: recovery-build-${{ github.ref }}
@@ -369,10 +373,42 @@ jobs:
         cat .repo/local_manifests/roomservice.xml || true
         repo sync -j"$(nproc --all)" -c --force-sync --no-clone-bundle --no-tags || true
 
-    - name: Set Swap Space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 12
+    # ──────────────────────────────────────────────────────────────
+    # 5.5 swap
+    #     标准 runner 只有 16GB 内存，AOSP 编译峰值会吃满并触发 OOM，
+    #     而 OOM 杀掉 runner agent 的表现就是 “lost communication with the server”。
+    #     但 swap 文件写在同一块盘上，开太大先把磁盘吃满同样会让 runner 失联，
+    #     所以这里按“可用磁盘的 1/4”封顶，且失败不中断。
+    # ──────────────────────────────────────────────────────────────
+    - name: Set up swap
+      continue-on-error: true
+      run: |
+        set -uo pipefail
+        MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
+        FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+        echo "内存 ${MEM_GB}GB / 根分区可用 ${FREE_GB}GB"
+        WANT=8
+        # 给 out/ 预留 16GB，剩下的才拿来当 swap
+        MAX=$(( FREE_GB - 16 ))
+        SIZE=$(( WANT < MAX ? WANT : MAX ))
+        if [ "$SIZE" -lt 2 ]; then
+          echo "::warning::可用磁盘 ${FREE_GB}GB 偏小（out/ 至少要留 16GB），跳过 swap"
+          exit 0
+        fi
+        [ "$SIZE" -lt "$WANT" ] && echo "::notice::磁盘偏紧，swap 降为 ${SIZE}GB"
+        echo "创建 ${SIZE}GB swap"
+        sudo swapoff -a 2>/dev/null || true
+        sudo rm -f /swapfile
+        if ! sudo fallocate -l "${SIZE}G" /swapfile 2>/dev/null; then
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=$((SIZE * 1024)) status=none
+        fi
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile >/dev/null
+        sudo swapon /swapfile
+        # 少换出，避免 swap 抖动把整机拖到心跳超时
+        sudo sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+        free -h
+        df -h /
 
     # ──────────────────────────────────────────────────────────────
     # 6. 编译
@@ -446,7 +482,30 @@ jobs:
         echo "TARGET_PRODUCT=$PRODUCT"
         echo "product=$PRODUCT" >> "$GITHUB_OUTPUT"
 
-        make -j"$(nproc --all)" "$MAKE_TARGET"
+        # 并行度必须按内存算：-j$(nproc) 在 16GB runner 上会让并行编译的
+        # clang/lld 把内存吃穿，OOM killer 杀掉 runner agent → 任务报
+        # “lost communication with the server”，日志断在半截。
+        CPUS=$(nproc --all)
+        MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
+        JOBS="${{ inputs.BUILD_JOBS }}"
+        case "$JOBS" in
+          ''|*[!0-9]*) JOBS=0 ;;
+        esac
+        if [ "$JOBS" -eq 0 ]; then
+          JOBS=$(( MEM_GB / 4 ))
+          [ "$JOBS" -gt "$CPUS" ] && JOBS=$CPUS
+          [ "$JOBS" -lt 2 ] && JOBS=2
+        fi
+        AVAIL_GB=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
+        echo "CPU=${CPUS} 内存=${MEM_GB}GB 磁盘可用=${AVAIL_GB}GB"
+        free -h || true
+        df -h . || true
+        if [ "$AVAIL_GB" -lt 15 ]; then
+          echo "::warning::磁盘仅剩 ${AVAIL_GB}GB，out/ 很可能写满导致 runner 失联"
+        fi
+        echo "并行度：make -j${JOBS}"
+
+        make -j"$JOBS" "$MAKE_TARGET"
 
     - name: Collect outputs
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
