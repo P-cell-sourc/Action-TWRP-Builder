@@ -306,7 +306,17 @@ jobs:
           done
         done
 
-        # (3) 预检：设备树继承的每个 $(SRC_TARGET_DIR)/product/*.mk 在源码里是否真的存在
+        # (3) 可选分区的输出路径
+        #     build/make/core/board_config.mk 的 check_image_config 规定：
+        #     只要声明了 BOARD_<P>IMAGE_FILE_SYSTEM_TYPE（或 PREBUILT），
+        #     就必须把该分区设为独立输出 TARGET_COPY_OUT_<P> := <P>，否则直接 $(error)。
+        #     设备树模板常只补 vendor/product/odm/vendor_dlkm，漏掉 system_ext，
+        #     lunch 就会报 TARGET_COPY_OUT_SYSTEM_EXT must be set to system_ext。
+        python3 "$GITHUB_WORKSPACE/scripts/fix_copy_out.py" \
+          "${{ inputs.DEVICE_PATH }}" "${{ inputs.COMMON_PATH }}" \
+          || echo "::warning::COPY_OUT 自动修复未完成，继续尝试编译"
+
+        # (4) 预检：设备树继承的每个 $(SRC_TARGET_DIR)/product/*.mk 在源码里是否真的存在
         MISSING=""
         REFS=0
         for ref in $(grep -rhoE '\$\(SRC_TARGET_DIR\)/product/[A-Za-z0-9_.-]+' $TREES --include="*.mk" 2>/dev/null | sort -u); do
@@ -401,8 +411,9 @@ jobs:
         echo "源码可用 release 配置：$(echo $RELS)"
 
         LUNCH_OK=""
+        LUNCH_ERR="$(mktemp)"
         try_lunch() {
-          lunch "$1" >/dev/null 2>&1 || return 1
+          lunch "$1" >"$LUNCH_ERR" 2>&1 || return 1
           [ -n "$(get_build_var TARGET_PRODUCT 2>/dev/null)" ]
         }
 
@@ -420,9 +431,12 @@ jobs:
         if [ -z "$LUNCH_OK" ]; then
           echo "::error::lunch 目标探测失败，下面打印现场用于排查"
           echo "===== device/ 顶层 ====="; ls device/ || true
-          echo "===== 所有 AndroidProducts.mk ====="; find device -maxdepth 3 -name AndroidProducts.mk || true
-          echo "===== 旧版格式完整输出 ====="; lunch "${MK}-eng" || true
-          echo "===== 三段式(ap2a)完整输出 ====="; lunch "${MK}-ap2a-eng" || true
+          echo "===== device/ 下三级目录里的 mk ====="; find device -maxdepth 4 -name "*.mk" 2>/dev/null | head -30 || true
+          echo "===== 所有 AndroidProducts.mk ====="; find device -maxdepth 4 -name AndroidProducts.mk || true
+          echo "===== 源码里的 release 配置目录 ====="; ls build/release/release_configs 2>/dev/null || echo "(不存在)"
+          echo "===== 最后一次 lunch 尝试的完整输出 ====="; cat "$LUNCH_ERR" || true
+          echo "===== 设备树 BoardConfig 里的分区/输出配置 ====="
+          grep -nE "TARGET_COPY_OUT_|BOARD_[A-Z0-9_]+IMAGE_(FILE_SYSTEM_TYPE|PARTITION_SIZE)|BOARD_[A-Z0-9_]+_LIST" "${{ inputs.DEVICE_PATH }}/BoardConfig.mk" 2>/dev/null || true
           exit 1
         fi
 
