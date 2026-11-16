@@ -387,7 +387,9 @@ jobs:
         MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
         FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
         echo "内存 ${MEM_GB}GB / 根分区可用 ${FREE_GB}GB"
-        WANT=8
+        # 社区经验：编译 AOSP 时 RAM + swap 至少要到 32GB，
+        # 16GB 内存的 runner 靠 swap 补齐（12GB → 合计 28GB）
+        WANT=12
         # 给 out/ 预留 16GB，剩下的才拿来当 swap
         MAX=$(( FREE_GB - 16 ))
         SIZE=$(( WANT < MAX ? WANT : MAX ))
@@ -405,10 +407,26 @@ jobs:
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile >/dev/null
         sudo swapon /swapfile
-        # 少换出，避免 swap 抖动把整机拖到心跳超时
-        sudo sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+        # 编译时希望内核愿意把冷页换出去（60 是默认值，
+        # 之前设成 10 会让内存吃紧时优先 OOM 而不是换出）
+        sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
         free -h
         df -h /
+
+    # ──────────────────────────────────────────────────────────────
+    # 5.6 soong_build 内存上限透传
+    #     build/soong/ui/build/soong.go 用 `env -i` 启动 soong_build，
+    #     父进程环境被清空，shell 里 export 的 GOMEMLIMIT/GOGC 传不进去，
+    #     结果就是解析 Android.bp 阶段（日志停在 cp soong_build 之后）
+    #     堆一路涨到被内核 OOM 杀掉。这里给源码打一个小补丁。
+    # ──────────────────────────────────────────────────────────────
+    - name: Patch soong_build memory limit propagation
+      continue-on-error: true
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        python3 "$GITHUB_WORKSPACE/scripts/patch_soong_memlimit.py" . \
+          || echo "::warning::未能打上 GOMEMLIMIT 透传补丁"
 
     # ──────────────────────────────────────────────────────────────
     # 6. 编译
@@ -509,8 +527,12 @@ jobs:
         # 让它多做 GC 而不是一路涨到被内核 OOM（在低内存 runner 上很常见）。
         if [ -z "${GOMEMLIMIT:-}" ]; then
           export GOMEMLIMIT=$(( MEM_GB * 70 / 100 ))GiB
-          echo "GOMEMLIMIT=$GOMEMLIMIT"
         fi
+        # GOGC 调低 → 更早、更频繁地 GC，堆峰值更低（用时间换内存）
+        export GOGC="${GOGC:-80}"
+        echo "GOMEMLIMIT=$GOMEMLIMIT GOGC=$GOGC"
+        echo "（这两个变量靠 scripts/patch_soong_memlimit.py 透传给 soong_build，"
+        echo "  否则 env -i 会把它们清掉）"
 
         # 心跳：每 60s 打一行内存/磁盘。进程被外部杀掉时日志会突然截断，
         # 有这条时间线就能看出是内存一路涨到顶，还是一直很平稳（外部原因）。
