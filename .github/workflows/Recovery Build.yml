@@ -278,22 +278,50 @@ jobs:
         rm -rf "$C"
         git clone --depth 1 -b "$BRANCH" "${{ inputs.COMMON_TREE_URL }}" "$C"
 
-    # 旧版 SebaUbuntu 生成器留下的过时配置，会让 Android 14+ 解析直接报错
+    # 旧版 twrpdtgen 模板生成的设备树会继承已被 AOSP 删除的配置，
+    # 这类问题在 lunch 阶段只会打印一句 "xxx does not exist"，很难定位，这里提前修掉。
     - name: Patch device tree
       continue-on-error: true
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
         set -uo pipefail
-        D="${{ inputs.DEVICE_PATH }}"
-        if [ ! -d "$D" ]; then
-          echo "::warning::设备树目录不存在，跳过"
-          exit 0
-        fi
-        if grep -rlq "PRODUCT_STATIC_BOOT_CONTROL_HAL" "$D" --include="*.mk" 2>/dev/null; then
-          for f in $(grep -rl "PRODUCT_STATIC_BOOT_CONTROL_HAL" "$D" --include="*.mk"); do
+        TREES="${{ inputs.DEVICE_PATH }} ${{ inputs.COMMON_PATH }}"
+        PREFIX='$(SRC_TARGET_DIR)/'
+
+        for D in $TREES; do
+          [ -d "$D" ] || { echo "::warning::目录不存在，跳过：$D"; continue; }
+
+          # (1) target/product/embedded.mk 在 Android 9 之后被 AOSP 删除，
+          #     现在等价的最小配置是 base.mk，否则 lunch 直接报 does not exist
+          for f in $(grep -rl "product/embedded\.mk" "$D" --include="*.mk" 2>/dev/null); do
+            sed -i -E 's@\$\(SRC_TARGET_DIR\)/product/embedded\.mk@$(SRC_TARGET_DIR)/product/base.mk@g' "$f"
+            sed -i -E 's@build/make/target/product/embedded\.mk@$(SRC_TARGET_DIR)/product/base.mk@g' "$f"
+            echo "已把 $f 的 embedded.mk 替换为 base.mk"
+          done
+
+          # (2) Android 14+ 已废弃 PRODUCT_STATIC_BOOT_CONTROL_HAL
+          for f in $(grep -rl "PRODUCT_STATIC_BOOT_CONTROL_HAL" "$D" --include="*.mk" 2>/dev/null); do
             sed -i '/PRODUCT_STATIC_BOOT_CONTROL_HAL/,+4d' "$f"
             echo "已从 $f 移除过时的 PRODUCT_STATIC_BOOT_CONTROL_HAL"
           done
+        done
+
+        # (3) 预检：设备树继承的每个 $(SRC_TARGET_DIR)/product/*.mk 在源码里是否真的存在
+        MISSING=""
+        REFS=0
+        for ref in $(grep -rhoE '\$\(SRC_TARGET_DIR\)/product/[A-Za-z0-9_.-]+' $TREES --include="*.mk" 2>/dev/null | sort -u); do
+          REFS=$((REFS + 1))
+          rel=${ref#"$PREFIX"}
+          if [ ! -f "build/make/target/$rel" ] && [ ! -f "build/target/$rel" ]; then
+            MISSING="$MISSING $rel"
+          fi
+        done
+        if [ -n "$MISSING" ]; then
+          echo "::warning::设备树继承了源码中不存在的产品配置：$MISSING（后续 lunch/make 很可能失败）"
+        elif [ "$REFS" -eq 0 ]; then
+          echo "设备树未引用 SRC_TARGET_DIR 下的产品配置，跳过继承预检"
+        else
+          echo "继承预检通过：$REFS 个 SRC_TARGET_DIR 引用全部存在"
         fi
 
     # ──────────────────────────────────────────────────────────────
