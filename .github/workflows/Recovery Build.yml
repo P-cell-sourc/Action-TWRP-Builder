@@ -462,6 +462,26 @@ jobs:
           || echo "::warning::-ndk_platform 后缀修补未完成，libtar 链接可能再次失败"
 
     # ──────────────────────────────────────────────────────────────
+    # 6.4 libtar 的 fscrypt 兼容层
+    #     TWRP 14.1 的两个仓库不同步：
+    #       system/vold @android-14.1 把 fscrypt_policy.h 换成了 v1/v2 接口，
+    #       删掉了 union fscrypt_policy 和 get_policy 等 5 个 helper；
+    #       而 bootable/recovery @android-14.1 的 libtar 还在用旧接口。
+    #     再加上 bionic 的 <linux/fscrypt.h> 有
+    #       #define fscrypt_policy fscrypt_policy_v1
+    #     这个宏会把 libtar 里的类型名整个改写，C 下直接报
+    #       "must use 'struct' tag to refer to type 'fscrypt_policy_v1'"。
+    #     → 生成 fscrypt_compat.h 补回旧 API，只改 include 行。
+    # ──────────────────────────────────────────────────────────────
+    - name: Patch libtar fscrypt API (TWRP 14.1 vold mismatch)
+      continue-on-error: true
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        python3 "$GITHUB_WORKSPACE/scripts/fix_libtar_fscrypt.py" . \
+          || echo "::warning::libtar fscrypt 兼容层未写入，编译可能再次失败"
+
+    # ──────────────────────────────────────────────────────────────
     # 6. 编译
     #    原脚本只试 <MAKEFILE_NAME>-eng，twrp-14/15 源的 release 段名不同，必须探测
     # ──────────────────────────────────────────────────────────────
