@@ -176,9 +176,11 @@ bootable/recovery/libtar/append.c:152:43: error: incompatible pointer types pass
 - `#undef fscrypt_policy` 解除 uapi 宏，重新 `typedef union fscrypt_policy { version; v1; v2; }`；
 - 用 `static inline` 补回 5 个纯计算的 helper（实现取自 TWRP 12.1 的 `fscrypt_policy.cpp`，逻辑就是按 `version` 取字段，不涉及 ioctl）；
 - `fscrypt_policy_get_struct` / `_set_struct` 用同名宏外加一次 cast，把 `union*` 转成 vold 期望的 `struct fscrypt_policy_v2 *`（`USE_FSCRYPT_POLICY_V1` 时自动切 v1）——日志里那条 `-Werror,-Wincompatible-pointer-types` 就是这么消掉的；
-- `lookup_ref_key` 在 14.1 的 vold 里只剩声明没有实现，兼容层提供返回 `false` 的版本（= 不往 tar 里写 key-ref 段，备份本身不受影响，不会产生未定义符号）；
+- `lookup_ref_key` / `lookup_ref_tar` 在 14.1 里被拆成了两步（先由 policy 反查 policy_type 串，再由串取 raw key），而 libtar 还在用老的一步式 `lookup_ref_tar(fep, policy)`；兼容层把这套接起来：`libtar_lookup_ref_tar` 先调 `lookup_ref_key` 拿到 `"2CE0"` 这类串，再调 vold 的 `lookup_ref_tar`，恢复加密目录策略的能力保持完整，不降级；
 - 源码侧只把 `#include "fscrypt_policy.h"` 换成 `#include "fscrypt_compat.h"`，不动任何业务代码；
 - 幂等（带 `LIBTAR_FSCRYPT_COMPAT_H` 标记），目录不存在时静默跳过。
+
+第二轮（`extract.c`）暴露出 `lookup_ref_tar` 同样是对不上的：vold 新签名是 `lookup_ref_tar(const uint8_t *policy_type, uint8_t *policy)`，libtar 却把 `union fscrypt_policy *` 直接当第一个参数传，触发同一条 `-Werror,-Wincompatible-pointer-types`。这一版把 `lookup_ref_key` / `lookup_ref_tar` 都接上了真实实现（`Decrypt.cpp:131` / `:179`），不是占位。
 
 本地已用 TWRP `android-14.1` 的真实 `libtar.h`/`block.c`/`append.c` + vold 的 `fscrypt_policy.h` 跑过脚本，并在 `-DUSE_FSCRYPT_POLICY_V1` 与 `-DUSE_FSCRYPT_POLICY_V2` 两种配置下用 `gcc -Werror=incompatible-pointer-types` 做了语法验证。
 

@@ -171,15 +171,29 @@ static inline void get_policy_content(fscrypt_policy* fep, char* content) {
     }
 }
 
-/* vold 14.1 只保留了 lookup_ref_key 的声明（实现被删），
- * 且签名是 v2*。libtar 只关心“有没有可用的 ref key”，
- * 返回 false 表示不写 key-ref 段，备份本身不受影响。 */
+/* vold 14.1 把 lookup_ref_key / lookup_ref_tar 拆成了两步：
+ *   lookup_ref_key(fep, policy_type)  —— 由 policy 结构反查 policy_type 串（"2CE0"）
+ *   lookup_ref_tar(policy_type, policy) —— 由 policy_type 串取回 raw key
+ * libtar 还是老的两参数版本（lookup_ref_tar(fep, policy)），这里把两步接起来，
+ * 保持原有恢复加密目录策略的能力。
+ * 注意：两个 helper 必须定义在下面的同名宏之前，函数体里的 lookup_ref_* 才会
+ * 解析到 vold 的真实实现，而不是被宏改写成自己。 */
 static inline bool libtar_lookup_ref_key(fscrypt_policy* fep, uint8_t* policy_type) {
-    (void)fep;
-    (void)policy_type;
-    return false;
+    if (!fep || !policy_type) return false;
+    return lookup_ref_key((LIBTAR_FSCRYPT_STRUCT *)(void *)fep, policy_type);
 }
+
+static inline bool libtar_lookup_ref_tar(fscrypt_policy* fep, uint8_t* policy) {
+    /* policy_type 串由 lookup_ref_key 填写；vold 侧用 std::string 解析，
+     * 依赖 NUL 终止，所以必须清零。 */
+    uint8_t policy_type[64] = {0};
+    if (!fep || !policy) return false;
+    if (!lookup_ref_key((LIBTAR_FSCRYPT_STRUCT *)(void *)fep, policy_type)) return false;
+    return lookup_ref_tar(policy_type, policy);
+}
+
 #define lookup_ref_key(fep, policy_type) libtar_lookup_ref_key((fep), (policy_type))
+#define lookup_ref_tar(fep, policy) libtar_lookup_ref_tar((fep), (policy))
 
 #endif /* LIBTAR_FSCRYPT_COMPAT_H */
 '''
