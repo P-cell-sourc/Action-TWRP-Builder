@@ -657,6 +657,31 @@ jobs:
         echo "TARGET_PRODUCT=$PRODUCT"
         echo "product=$PRODUCT" >> "$GITHUB_OUTPUT"
 
+        # 产物目录以 get_build_var 为准，不要用 out/target/product/$TARGET_PRODUCT
+        # 硬拼——TWRP 的 PRODUCT_OUT 有时带前缀，硬拼会指到一个不存在的目录
+        PRODUCT_OUT_REAL=$(get_build_var PRODUCT_OUT 2>/dev/null || true)
+        [ -z "$PRODUCT_OUT_REAL" ] && PRODUCT_OUT_REAL="out/target/product/${PRODUCT}"
+        echo "PRODUCT_OUT=$PRODUCT_OUT_REAL"
+        echo "product_out=$PRODUCT_OUT_REAL" >> "$GITHUB_OUTPUT"
+
+        # 目标名必须和设备树真实拥有的分区对齐：
+        #   设备树没开 BOARD_USES_VENDOR_BOOTIMAGE 时，vendorbootimage 在
+        #   build/make 里是个「没有依赖也没有配方」的空目标，make 只会
+        #   回一句 Nothing to be done 然后 exit 0 —— 表现就是「编译成功
+        #   但没有生成任何 .img」。这里提前对齐，不要等打包阶段才发现。
+        if [ "$MAKE_TARGET" = "vendorbootimage" ]; then
+          VB=$(get_build_var BOARD_USES_VENDOR_BOOTIMAGE 2>/dev/null || true)
+          echo "BOARD_USES_VENDOR_BOOTIMAGE=${VB:-<未定义>}"
+          case "$VB" in
+            true|TRUE|1) : ;;
+            *)
+              echo "::warning::设备树未开启 vendor_boot，vendorbootimage 是空目标 → 自动改用 bootimage"
+              MAKE_TARGET="bootimage"
+              ;;
+          esac
+        fi
+        echo "MAKE_TARGET=$MAKE_TARGET"
+
         # 并发按内存算：-j$(nproc) 在 16GB runner 上会把内存吃穿，
         # OOM 杀掉 runner agent 的表现就是 "lost communication with the server"
         CPUS=$(nproc --all)
@@ -716,6 +741,46 @@ jobs:
         make -j"$JOBS" "$MAKE_TARGET" 2>&1 | tee build.log || RC=${PIPESTATUS[0]}
         trap - TERM INT
         stop_hb
+
+        # ────────────────────────────────────────────────────────────
+        # 产物自检
+        #   make 返回 0 但一个 .img 都没有的场景有两种：
+        #   (a) 目标名和设备树对不上（比如设备只有 boot 分区却被要求
+        #       vendorbootimage），kati 把它当成已满足的空目标；
+        #   (b) 产物写到了 PRODUCT_OUT 之外的目录。
+        #   两种情况都在这里当场发现并补编，不要让后面 Collect 才报
+        #   "没有生成任何 .img" 这种没有信息量的错。
+        # ────────────────────────────────────────────────────────────
+        count_imgs() { ls -1 "$PRODUCT_OUT_REAL"/*.img 2>/dev/null | wc -l; }
+        if [ "$RC" -eq 0 ] && [ "$(count_imgs)" -eq 0 ]; then
+          echo "::warning::make 退出码 0，但 $PRODUCT_OUT_REAL 下没有任何 .img"
+          echo "===== build.log 最后 30 行 ====="
+          tail -30 build.log 2>/dev/null || true
+          echo "===== 是否 Nothing to be done / 目标被忽略 ====="
+          grep -nE "Nothing to be done|No rule to make target" build.log || echo "(无该提示)"
+          echo "===== out/target/product 下的目录 ====="
+          ls -1 out/target/product 2>/dev/null || echo "(空)"
+          echo "===== 其它目录里是否已有镜像 ====="
+          find out/target/product -maxdepth 2 -name "*.img" 2>/dev/null | head -20 || true
+          # 逐级降级补编：已编译的对象都在，补编只是打包，很快
+          for t in bootimage recoveryimage vendorbootimage; do
+            [ "$t" = "$MAKE_TARGET" ] && continue
+            echo "::group::补编目标 $t"
+            make -j"$JOBS" "$t" 2>&1 | tee -a build.log || echo "::warning::$t 未编出结果"
+            echo "::endgroup::"
+            if [ "$(count_imgs)" -gt 0 ]; then
+              echo "::notice::$t 产出了镜像"
+              RC=0
+              break
+            fi
+          done
+          if [ "$(count_imgs)" -eq 0 ]; then
+            echo "::group::补编目标 droid（全量打包）"
+            make -j"$JOBS" droid 2>&1 | tee -a build.log || echo "::warning::droid 未编出结果"
+            echo "::endgroup::"
+          fi
+          [ "$(count_imgs)" -gt 0 ] && RC=0
+        fi
 
         show_failed() {
           awk -v max="${2:-3}" '
@@ -807,25 +872,58 @@ jobs:
     # 8. 产物
     # ──────────────────────────────────────────────────────────────
     - name: Collect outputs
+      id: collect
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
         set -uo pipefail
-        OUT="out/target/product/${{ steps.build.outputs.product }}"
-        echo "===== 产物目录：$OUT ====="
-        ls -lh "$OUT"/*.img "$OUT"/*.zip 2>/dev/null || true
+        OUT="${{ steps.build.outputs.product_out }}"
+        [ -z "$OUT" ] && OUT="out/target/product/${{ steps.build.outputs.product }}"
+
+        echo "===== 期望产物目录：$OUT ====="
+        if [ -d "$OUT" ]; then
+          ls -lh "$OUT"/ 2>/dev/null | head -40 || true
+          echo "----- .img / .zip -----"
+          ls -lh "$OUT"/*.img "$OUT"/*.zip 2>/dev/null || echo "(该目录下没有 img/zip)"
+        else
+          echo "(目录不存在)"
+        fi
+
+        # 兜底：在整个 out/ 里找镜像，产物目录名有时和设备树对不上
         if ! ls "$OUT"/*.img >/dev/null 2>&1; then
-          echo "::error::没有生成任何 .img，请检查上面的编译日志"
+          echo "===== 在 out/target/product 下全量搜索 .img ====="
+          find out/target/product -maxdepth 2 -name "*.img" -size +1M 2>/dev/null | head -20 || true
+          CAND=$(find out/target/product -maxdepth 2 -name "*.img" -size +1M -printf '%h\n' 2>/dev/null | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+          if [ -n "$CAND" ]; then
+            echo "::notice::在 $CAND 找到镜像，改用它作为产物目录"
+            OUT="$CAND"
+          fi
+        fi
+
+        # 统一收口到 dist/，上传步骤只看这一个目录
+        rm -rf dist && mkdir -p dist
+        shopt -s nullglob
+        imgs=("$OUT"/*.img) zips=("$OUT"/*.zip)
+        for f in "${imgs[@]}" "${zips[@]}"; do cp -f "$f" dist/ 2>/dev/null || true; done
+        shopt -u nullglob
+        echo "dist=dist" >> "$GITHUB_OUTPUT"
+
+        echo "===== 交付目录 dist/ ====="
+        ls -lh dist/ 2>/dev/null || true
+        if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+          echo "::error::没有生成任何 .img/.zip —— make 成功但没打包出镜像"
+          echo "常见原因：BUILD_TARGET 与该设备树的分区不匹配（例：设备没有 vendor_boot 却要求 vendorbootimage），"
+          echo "或 BoardConfig 未开启对应镜像（BOARD_USES_VENDOR_BOOTIMAGE / BOARD_USES_RECOVERY_AS_BOOT）。"
+          echo "请把本次运行的 build.log 尾部贴出来。"
           exit 1
         fi
 
     - name: Upload artifacts (always)
-      if: always() && steps.build.outputs.product != ''
+      if: always() && steps.collect.outputs.dist != ''
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
         path: |
-          workspace/out/target/product/${{ steps.build.outputs.product }}/*.img
-          workspace/out/target/product/${{ steps.build.outputs.product }}/*.zip
+          workspace/dist/*
         if-no-files-found: warn
 
     - name: Upload to Release
@@ -833,8 +931,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          workspace/out/target/product/${{ steps.build.outputs.product }}/*.img
-          workspace/out/target/product/${{ steps.build.outputs.product }}/*.zip
+          workspace/dist/*
         name: ${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         fail_on_unmatched_files: false
