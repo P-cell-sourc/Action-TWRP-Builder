@@ -386,7 +386,15 @@ jobs:
         python3 "$GITHUB_WORKSPACE/scripts/fix_device_avb.py" $TREES \
           || echo "::warning::chained AVB 变量自动补全未完成，继续尝试编译"
 
-        # (5) 预检：设备树继承的 $(SRC_TARGET_DIR)/product/*.mk 是否真的存在
+        # (5) vendor_boot：变量名纠错 + AVB 四项
+        #     AOSP 判断是否构建 vendor_boot.img 用的是 BOARD_USES_VENDOR_BOOTIMAGE，
+        #     写成 BOARD_USES_VENDOR_BOOT 时 ifeq 不成立，vendorbootimage 会变成
+        #     「没有依赖也没有配方」的空目标——make 打印 Nothing to be done 并
+        #     exit 0，产物目录里自然一个 vendor_boot.img 都没有。
+        python3 "$GITHUB_WORKSPACE/scripts/fix_device_vendor_boot.py" . "${{ inputs.DEVICE_PATH }}" \
+          || echo "::warning::vendor_boot 配置修补未完成，继续尝试编译"
+
+        # (6) 预检：设备树继承的 $(SRC_TARGET_DIR)/product/*.mk 是否真的存在
         MISSING=""
         REFS=0
         for ref in $(grep -rhoE '\$\(SRC_TARGET_DIR\)/product/[A-Za-z0-9_.-]+' $TREES --include="*.mk" 2>/dev/null | sort -u); do
@@ -675,7 +683,7 @@ jobs:
           case "$VB" in
             true|TRUE|1) : ;;
             *)
-              echo "::warning::设备树未开启 vendor_boot，vendorbootimage 是空目标 → 自动改用 bootimage"
+              echo "::warning::设备树未开启 vendor_boot，vendorbootimage 是空目标 → 自动改用 bootimage（检查 BoardConfig 里是否是写成了 BOARD_USES_VENDOR_BOOT，正确名是 BOARD_USES_VENDOR_BOOTIMAGE）"
               MAKE_TARGET="bootimage"
               ;;
           esac

@@ -411,6 +411,27 @@ make: Nothing to be done for 'vendorbootimage'.
 
 **顺带说清楚**：`BUILD_TARGET` 要填设备**真实有**的那个分区。vivo 这类把 recovery 塞进 `boot` 的机型填 `boot`；确实有独立 `vendor_boot` 分区（GKI 机型常见）才填 `vendorboot`。
 
+### 18. 要 `vendor_boot.img`，但设备树里变量名写错了
+
+**现象**：`BUILD_TARGET=vendorboot` 跑完，`BOARD_USES_VENDOR_BOOTIMAGE=<未定义>`，只得到 `boot.img`。
+
+**根因**：设备树里写的是
+
+```make
+BOARD_USES_VENDOR_BOOT := true        # ← AOSP 没有这个变量
+```
+
+而 `build/make/core/Makefile` 判断的是 **`BOARD_USES_VENDOR_BOOTIMAGE`**（多一个 `IMAGE`）。名字不对 → 整个 vendor_boot 分支被跳过 → `vendorbootimage` 成为空目标，`make` 返回 0 却不出镜像，和第 17 条是同一个表现、不同根源。
+
+**改法**：新增 `scripts/fix_device_vendor_boot.py`，接在 `Patch device tree` 的第 (5) 步，对设备树做四件事（幂等，带 `# [twrp-builder-fix]` 标记）：
+
+1. `BOARD_USES_VENDOR_BOOT := true` → `BOARD_USES_VENDOR_BOOTIMAGE := true`（没有就补上）；
+2. 补 `BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT := true`，把 TWRP 的 `recovery/root` 与 ramdisk 挪进 vendor_boot；
+3. `BOARD_BOOT_HEADER_VERSION` 不是 3/4 时纠正为 4（vendor_boot 只支持 v3/v4）；
+4. `BOARD_AVB_ENABLE=true` 时补齐 vendor_boot 的 AVB 四项：`_KEY_PATH` / `_ALGORITHM` / `_ROLLBACK_INDEX`（沿用 boot 的写法）/ `_ROLLBACK_INDEX_LOCATION`（自动取 1..15 里最小的未占号，本例 1、2、3 已被 vbmeta_system / vbmeta_vendor / boot 占掉，取 4）。
+
+**为什么 AVB 那四项一定不能漏**：有些机型不允许刷 `vbmeta` 去关校验（`fastboot --disable-verification flash vbmeta` 会失败或直接不启动）。这种情况下镜像自身必须带 hash footer，否则 bootloader 连"结构合法"这一步都过不了。
+
 ## 四、怎么用
 
 二选一：
