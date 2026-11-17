@@ -555,6 +555,24 @@ jobs:
           || echo "::warning::libtar 链接依赖未补齐，链接可能再次失败"
 
     # ──────────────────────────────────────────────────────────────
+    # 5.11 recovery 的 FDE（全盘加密）API
+    #      partition.cpp / partitionmanager.cpp 在 #ifdef TW_INCLUDE_CRYPTO 里
+    #      调用 set_partition_data / cryptfs_check_footer /
+    #      cryptfs_get_password_type / delete_crypto_blk_dev /
+    #      cryptfs_check_passwd，而 vold 的 android-14.1 分支已经把它们删了
+    #      （cryptfs.h 只剩 cryptfs_setup_ext_volume / cryptfs_get_keygen）。
+    #      编译到 86% 会报一串 use of undeclared identifier。
+    #      AOSP 13 起只有 FBE，这些 FDE 调用永远不会被走到，补占位即可。
+    # ──────────────────────────────────────────────────────────────
+    - name: Patch recovery FDE API (vold 14 dropped cryptfs FDE)
+      continue-on-error: true
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        python3 "$GITHUB_WORKSPACE/scripts/fix_recovery_cryptfs.py" . \
+          || echo "::warning::recovery FDE 兼容层未写入，partition.cpp 可能编译失败"
+
+    # ──────────────────────────────────────────────────────────────
     # 6. 编译
     # ──────────────────────────────────────────────────────────────
     - name: Building recovery

@@ -309,6 +309,47 @@ sudo sed -i -E "$TUNA_SED" /etc/apt/sources.list || echo "::warning::换源失�
 
 同时补了两处健壮性：换源失败只 warning 不中断；换完校验是否真的出现 `tuna.tsinghua.edu.cn`，没有就打印当前生效的源，方便 runner 改域名时快速定位。
 
+### 15. `partition.cpp` 报一串 `use of undeclared identifier`（FDE API 被 vold 删了）
+
+```
+bootable/recovery/partition.cpp:711:5: error: use of undeclared identifier 'set_partition_data'
+bootable/recovery/partition.cpp:712:9: error: use of undeclared identifier 'cryptfs_check_footer'
+bootable/recovery/partition.cpp:718:46: error: use of undeclared identifier 'cryptfs_get_password_type'
+bootable/recovery/partition.cpp:2163:7: error: use of undeclared identifier 'delete_crypto_blk_dev'
+bootable/recovery/partitionmanager.cpp:635:24: error: use of undeclared identifier 'cryptfs_get_password_type'
+bootable/recovery/partitionmanager.cpp:2187:13: error: use of undeclared identifier 'cryptfs_check_passwd'
+```
+
+**原因**：又是同一分支内两个仓库不同步，这次是 FDE（全盘加密）那一套 API。
+
+| 仓库 @android-14.1 | 状态 |
+|---|---|
+| `TeamWin/android_system_vold` | `cryptfs.h` 只剩 `cryptfs_setup_ext_volume` / `cryptfs_get_keygen`，`set_partition_data`、`cryptfs_check_footer`、`cryptfs_get_password_type`、`delete_crypto_blk_dev`、`cryptfs_check_passwd` 连同 `cryptfs.cpp` 里的实现全部删除 |
+| `TeamWin/android_bootable_recovery` | `partition.cpp` / `partitionmanager.cpp` 仍在 `#ifdef TW_INCLUDE_CRYPTO` 里调用这 5 个函数 |
+
+AOSP 13 起 vold 已彻底不支持 FDE，所有设备都是 FBE；FBE 解密走 `Decrypt_DE()` / `Decrypt_CE()` + keymaster/gatekeeper，不经过 crypto footer。这些调用点全部位于「FBE 建立失败 → 回退尝试 FDE」的兜底分支。
+
+**改法**：不删代码、不改调用点（删代码会破坏 `if/else if` 结构，风险更高），而是新增 `scripts/fix_recovery_cryptfs.py`，在 `bootable/recovery/cryptfs_fde_compat.h` 里给 5 个函数提供语义正确的 `static inline` 占位，然后在原本 `#include "cryptfs.h"` 的下一行插一行 include：
+
+```c
+#include "cryptfs.h"
+#include "cryptfs_fde_compat.h"   /* ← 新增，缩进与原行一致 */
+```
+
+占位返回值都和「没有 FDE」这一事实一致：
+
+| 函数 | 返回 | 上层行为 |
+|---|---|---|
+| `set_partition_data()` | 空实现 | — |
+| `cryptfs_check_footer()` | `-1` | 判定为没有 crypto footer，走提示分支 |
+| `cryptfs_get_password_type()` | `-1` | 不误判成「默认密码加密」，避免触发必然失败的解密 |
+| `delete_crypto_blk_dev()` | `0` | 无 dm 设备可删，视为成功，不刷错误日志 |
+| `cryptfs_check_passwd()` | `-1` | FDE 密码校验失败，与真实状态一致 |
+
+vold 的 `cryptfs.h` 仍然先生效（`CRYPT_TYPE_*`、`KeyBuffer` 等照旧可用），只在缺函数时由兼容头补位。头里还兜底了 `CRYPT_TYPE_DEFAULT`（现在只定义在 `fscrypt-common.h`）。
+
+验证：用 TWRP `android-14.1` 的真实 `partition.cpp` / `partitionmanager.cpp` 跑脚本，插入位置正确、缩进一致；重复执行不再插入；`bootable/recovery` 不存在时静默退出。并用 `g++ -std=gnu++17 -Wall -Wextra -Werror` 和 `gcc -std=gnu11 -Werror` 对模拟调用点做了语法校验，两种语言都通过（包括 `(char*)("userdata")` 传 `char*` 这种实参形态）。
+
 ## 四、怎么用
 
 二选一：
