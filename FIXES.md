@@ -232,6 +232,46 @@ SHARED_LIBS = ... libboot_control_client libsysutils android.hardware.boot@1.0 .
 
 重复执行无二次修改。
 
+### 13. `soong bootstrap failed`：chained vbmeta 分区没有签名 key
+
+libtar 链接依赖补上之后，流程走到 `Building recovery`，但这次只跑了 **1 分 6 秒**就退出，停在 soong 解析 Android.bp 的阶段：
+
+```
+[100% 132/132] analyzing Android.bp files and generating ninja file at out/soong/build.twrp_PD2551.ninja
+FAILED: out/soong/build.twrp_PD2551.ninja
+env -i "$BUILDER" --top "$TOP" ... Android.bp
+error: build/soong/fsgen/Android.bp:32:1: module "soong_filesystem_creator":
+  No key found for chained avb partition "vbmeta_system"
+04:37:10 soong bootstrap failed with: exit status 1
+```
+
+原因是设备树 `BoardConfig.mk` 里只写了 chained 分区，没给它的 key：
+
+```make
+BOARD_AVB_ENABLE := true
+BOARD_AVB_VBMETA_SYSTEM := system                                  # ← 声明了
+BOARD_AVB_VENDOR_BOOT_KEY_PATH := external/avb/test/data/testkey_rsa2048.pem
+BOARD_AVB_VENDOR_BOOT_ALGORITHM := SHA256_RSA2048
+# 缺 BOARD_AVB_VBMETA_SYSTEM_KEY_PATH
+```
+
+AOSP 14 的 `build/soong/fsgen` 会为每个 `BOARD_AVB_VBMETA_*` 分区准备签名参数（生成 `vbmeta_system` 的签 rules），拿不到 `KEY_PATH` 就在 bootstrap 阶段直接 panic。它发生在编译开始后 1 分钟，很容易被误判成“环境/内存问题”，其实是设备树配置不全。
+
+修法：新增 `scripts/fix_device_avb.py`，在 `Patch device tree` 步骤里扫描设备树所有 `BoardConfig*.mk`：
+
+- 找出所有 `BOARD_AVB_VBMETA_<X> := ...` 声明（排除 `_KEY_PATH` / `_ALGORITHM` / `_ROLLBACK_INDEX` 等属性变量）；
+- 对缺 `BOARD_AVB_VBMETA_<X>_KEY_PATH` 的，按设备树已有的 `BOARD_AVB_VENDOR_BOOT_KEY_PATH` 补齐（没有则用 `external/avb/test/data/testkey_rsa2048.pem`）；`_ALGORITHM` 同理跟随 `BOARD_AVB_VENDOR_BOOT_ALGORITHM`；
+- 只补 `KEY_PATH` 与 `ALGORITHM`，不碰 rollback index，避免改变设备原有的回滚语义；
+- 幂等（`# [twrp-builder-fix]` 标记），没有 chained 分区或没有 `BoardConfig` 时静默退出。
+
+对当前 PD2551 设备树的实际效果是追加三行：
+
+```make
+# [twrp-builder-fix] chained vbmeta 分区的签名 key
+BOARD_AVB_VBMETA_SYSTEM_KEY_PATH := external/avb/test/data/testkey_rsa2048.pem
+BOARD_AVB_VBMETA_SYSTEM_ALGORITHM := SHA256_RSA2048
+```
+
 ## 四、怎么用
 
 二选一：
