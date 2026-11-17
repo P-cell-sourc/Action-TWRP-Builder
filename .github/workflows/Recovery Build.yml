@@ -125,19 +125,26 @@ jobs:
         #   22.04 用 /etc/apt/sources.list，24.04 改成 deb822 的 ubuntu.sources，
         #   两个都处理一遍，镜像升级了也不会失效。
         echo "::group::switch to TUNA mirror"
+        #   注意：分隔符必须避开 '|'，因为 -E 模式下该字符在正则里是“或”，
+        #   sed 会把它当成分隔符截断表达式（unknown option to `s'）。
+        #   这里用 '#' 作分隔符，URL 中不含 '#'，安全。
+        #   加 '|| echo warning' 是为了：换源失败也不应该中断整次构建。
+        TUNA_SED='s#https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu#https://mirrors.tuna.tsinghua.edu.cn/ubuntu#g'
         if [ -f /etc/apt/sources.list ]; then
           sudo cp -f /etc/apt/sources.list /etc/apt/sources.list.bak
-          sudo sed -i -E \
-            's|https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
-            /etc/apt/sources.list
+          sudo sed -i -E "$TUNA_SED" /etc/apt/sources.list \
+            || echo "::warning::sources.list 换源失败，继续使用默认源"
         fi
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak
-          sudo sed -i -E \
-            's|https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
-            /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i -E "$TUNA_SED" /etc/apt/sources.list.d/ubuntu.sources \
+            || echo "::warning::ubuntu.sources 换源失败，继续使用默认源"
         fi
         grep -rhoE "https?://[^ ]*ubuntu[^ ]*" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | sort -u || true
+        if ! sudo grep -rqs "mirrors.tuna.tsinghua.edu.cn" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null; then
+          echo "::warning::未检测到清华源，下面打印当前生效的源（runner 换域名时据此调整正则）"
+          sudo grep -rhsE "^(deb |URIs)" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | head -10 || true
+        fi
         echo "::endgroup::"
 
         APT_OPTS="-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=5"

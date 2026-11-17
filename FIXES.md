@@ -285,6 +285,30 @@ build/make/core/Makefile:4815: error: BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX is 
 
 因为 `add-vbmeta-image` 对四个变量都做了 `$(if ...)` 非空校验，缺一个就 `$(error)`。所以脚本改成四项全覆盖。
 
+### 14. 换清华源时 `sed` 报 `unknown option to 's'`
+
+```
+switch to TUNA mirror
+sed: -e expression #1, char 30: unknown option to `s'
+Error: Process completed with exit code 1.
+```
+
+**原因**：`sed -E` 下 `|` 是正则里的“或”，却被当成了替换命令的分隔符：
+
+```bash
+# 错：分隔符 | 与 alternation | 冲突，表达式在 (archive 处被截断
+sudo sed -i -E 's|https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu|https://...|g' ...
+```
+
+**改法**：换一个 URL 里不会出现的字符作分隔符（`#`），并把表达式抽成变量复用：
+
+```bash
+TUNA_SED='s#https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu#https://mirrors.tuna.tsinghua.edu.cn/ubuntu#g'
+sudo sed -i -E "$TUNA_SED" /etc/apt/sources.list || echo "::warning::换源失败，继续使用默认源"
+```
+
+同时补了两处健壮性：换源失败只 warning 不中断；换完校验是否真的出现 `tuna.tsinghua.edu.cn`，没有就打印当前生效的源，方便 runner 改域名时快速定位。
+
 ## 四、怎么用
 
 二选一：
@@ -304,8 +328,9 @@ git apply /path/to/fix.patch
 1. **`DEVICE_NAME` 必须等于 lunch 出来的 `TARGET_PRODUCT`**。默认值我改成了 `PD2551`；若你的设备树实际产品名不是它，运行时会打印 `TARGET_PRODUCT=...`，按那个填。上传目录现在用构建时探测到的真实产品名，即使填错也不会丢产物。
 2. **`ANDROID 14` 源 + vivo vendor_boot 这类设备**，如果编译阶段报 `PRODUCT_STATIC_BOOT_CONTROL_HAL` 或 bootctrl 模块缺失，脚本里的 `Patch device tree` 步骤会自动清理（已设为 `continue-on-error`，不会反过来把构建搞挂）。若仍失败，把 `Building recovery` 那一步最后 50 行日志贴给我，我按实际报错继续修——那是设备树内容问题，不是脚本问题。
 
-另外，如果你的 runner 拉 `archive.ubuntu.com` 很慢（国内网络常见），可以只在 `Prepare the environment` 开头加一行换源，不影响其他逻辑：
+另外，如果你的 runner 拉 `archive.ubuntu.com` 很慢（国内网络常见），workflow 的 `Prepare the environment (TUNA mirror)` 步骤已经内置换源，无需再手动加。若要自己写，注意分隔符不要用 `|`（`sed -E` 下它是 alternation，会被误认为分隔符）：
 
 ```yaml
-        sudo sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/ubuntu.sources
+        sudo sed -i -E 's#http://(archive|security)\.ubuntu\.com#https://mirrors.tuna.tsinghua.edu.cn#g' \
+          /etc/apt/sources.list
 ```
