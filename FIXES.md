@@ -350,6 +350,39 @@ vold 的 `cryptfs.h` 仍然先生效（`CRYPT_TYPE_*`、`KeyBuffer` 等照旧可
 
 验证：用 TWRP `android-14.1` 的真实 `partition.cpp` / `partitionmanager.cpp` 跑脚本，插入位置正确、缩进一致；重复执行不再插入；`bootable/recovery` 不存在时静默退出。并用 `g++ -std=gnu++17 -Wall -Wextra -Werror` 和 `gcc -std=gnu11 -Werror` 对模拟调用点做了语法校验，两种语言都通过（包括 `(char*)("userdata")` 传 `char*` 这种实参形态）。
 
+### 16. 链接 `recovery` 可执行文件：`NetlinkEvent::dump()` / `findParam()` 未定义
+
+```
+FAILED: out/target/product/PD2551/obj/EXECUTABLES/recovery_intermediates/LINKED/recovery
+ld.lld: error: undefined symbol: _ZN12NetlinkEvent4dumpEv
+>>> referenced by VolumeManager.cpp:208 (system/vold/VolumeManager.cpp:208)
+ld.lld: error: undefined symbol: _ZN12NetlinkEvent9findParamEPKc
+>>> referenced by VolumeManager.cpp:211 (system/vold/VolumeManager.cpp:211)
+clang++: error: linker command failed with exit code 1
+```
+
+构建到 **96%**，前面所有源码级错误都已通过。
+
+**原因**：`bootable/recovery/Android.mk` 里 recovery 也静态链了 vold：
+
+```make
+LOCAL_STATIC_LIBRARIES += libguitwrp libvold
+```
+
+`libvold.a` 的 `VolumeManager.cpp` 在 AOSP 14 调用了 `NetlinkEvent::dump()` 和 `findParam()`，这两个符号由 `libsysutils` 提供。但 recovery 的 `LOCAL_SHARED_LIBRARIES` 依赖表停在 Android 12，没有 `libsysutils`。
+
+第 12 条修的是 **libtar.so** 的链接（同一批符号），recovery 是另一条独立的链接线，必须单独补——`TWRP_REQUIRED_MODULES` 里的 `libsysutils` 只是保证模块被编译出来，不等于被链接进来。
+
+**改法**：新增 `scripts/fix_recovery_link.py`，在 `LOCAL_MODULE := recovery` 模块块内（到 `include $(BUILD_` 为止）找到第一条 `LOCAL_SHARED_LIBRARIES` 行，行尾追加 `libsysutils`：
+
+```make
+LOCAL_SHARED_LIBRARIES += libz libc libcutils ... libtwadbbu libsysutils
+```
+
+只改这一行：条件分支都排在它之后，因此不会把库加进 `ifneq` 分支；`libtar` 和其他模块不受影响。
+
+验证：用 TWRP 真实 `Android.mk` 跑，diff 只有一行、单空格、追加在行尾；重复执行输出“已含 libsysutils，无需修改”；`Android.mk` 不存在时静默退出。
+
 ## 四、怎么用
 
 二选一：

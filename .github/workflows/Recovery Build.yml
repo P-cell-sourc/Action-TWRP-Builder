@@ -573,6 +573,21 @@ jobs:
           || echo "::warning::recovery FDE 兼容层未写入，partition.cpp 可能编译失败"
 
     # ──────────────────────────────────────────────────────────────
+    # 5.12 recovery 可执行文件的链接依赖
+    #      recovery 也静态链了 libvold（LOCAL_STATIC_LIBRARIES += libvold），
+    #      AOSP 14 的 VolumeManager.cpp 调用 NetlinkEvent::dump() /
+    #      findParam()，这两个符号由 libsysutils 提供，但 recovery 的
+    #      LOCAL_SHARED_LIBRARIES 里没有它 → 96% 链接 recovery 时 undef。
+    # ──────────────────────────────────────────────────────────────
+    - name: Patch recovery link libraries (libsysutils)
+      continue-on-error: true
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        python3 "$GITHUB_WORKSPACE/scripts/fix_recovery_link.py" . \
+          || echo "::warning::recovery 链接依赖未补齐，recovery 可能链接失败"
+
+    # ──────────────────────────────────────────────────────────────
     # 6. 编译
     # ──────────────────────────────────────────────────────────────
     - name: Building recovery
