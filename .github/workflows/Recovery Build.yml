@@ -482,6 +482,24 @@ jobs:
           || echo "::warning::libtar fscrypt 兼容层未写入，编译可能再次失败"
 
     # ──────────────────────────────────────────────────────────────
+    # 6.5 libtar 链接依赖
+    #     libtar 用 LOCAL_STATIC_LIBRARIES += libvold 把整个 vold 静态库链进来，
+    #     但 AOSP 14 的 vold 新增了三个依赖，libtar 的 Android.mk 还停在 12：
+    #       Checkpoint.cpp    -> android::hal::BootControlClient::WaitForService()
+    #       VolumeManager.cpp -> NetlinkEvent::dump() / findParam()
+    #       VolumeManager.cpp -> async_safe_format_log()
+    #     → 补 libboot_control_client / libsysutils（shared）与 libasync_safe（static），
+    #       与 system/vold/Android.bp 的 vold_default_libs 对齐。
+    # ──────────────────────────────────────────────────────────────
+    - name: Patch libtar link libraries (vold 14 deps)
+      continue-on-error: true
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        python3 "$GITHUB_WORKSPACE/scripts/fix_libtar_link.py" . \
+          || echo "::warning::libtar 链接依赖未补齐，链接可能再次失败"
+
+    # ──────────────────────────────────────────────────────────────
     # 6. 编译
     #    原脚本只试 <MAKEFILE_NAME>-eng，twrp-14/15 源的 release 段名不同，必须探测
     # ──────────────────────────────────────────────────────────────

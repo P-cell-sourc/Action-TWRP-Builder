@@ -184,6 +184,54 @@ bootable/recovery/libtar/append.c:152:43: error: incompatible pointer types pass
 
 本地已用 TWRP `android-14.1` 的真实 `libtar.h`/`block.c`/`append.c` + vold 的 `fscrypt_policy.h` 跑过脚本，并在 `-DUSE_FSCRYPT_POLICY_V1` 与 `-DUSE_FSCRYPT_POLICY_V2` 两种配置下用 `gcc -Werror=incompatible-pointer-types` 做了语法验证。
 
+### 12. `libtar` 链接失败：`libvold` 在 AOSP 14 新增的三个依赖
+
+`fscrypt` 兼容层生效后，`append.c` / `block.c` / `extract.c` / `libtar.h` / `output.c` 全部编译通过，构建推进到 80%（44 分钟），卡在 `libtar.so` 的**链接**阶段：
+
+```
+FAILED: out/target/product/PD2551/obj/SHARED_LIBRARIES/libtar_intermediates/LINKED/libtar.so
+ld.lld: error: undefined symbol: _ZN7android3hal17BootControlClient14WaitForServiceEv
+>>> referenced by Checkpoint.cpp:141 (system/vold/Checkpoint.cpp:141)
+ld.lld: error: undefined symbol: _ZN12NetlinkEvent4dumpEv
+ld.lld: error: undefined symbol: _ZN12NetlinkEvent9findParamEPKc
+>>> referenced by VolumeManager.cpp:211
+ld.lld: error: undefined symbol: async_safe_format_log
+>>> referenced by VolumeManager.cpp:538
+```
+
+`libtar` 的 `Android.mk` 用 `LOCAL_STATIC_LIBRARIES += libvold` 把**整个** vold 静态库链进来（为了复用 `Decrypt.cpp` / `fscrypt_policy.cpp` 的实现），但依赖表还停在 Android 12。AOSP 14 的 `system/vold/Android.bp` 里 `vold_default_libs` 已经多了三项：
+
+| 符号 | 提供者 | 类型 |
+|---|---|---|
+| `BootControlClient::WaitForService()` | `libboot_control_client` | shared |
+| `NetlinkEvent::dump()` / `findParam()` | `libsysutils` | shared |
+| `async_safe_format_log` | `libasync_safe`（bionic） | static |
+
+这些库 vold 自己能链，是因为 `vold_default_libs` 里有；`libtar` 复用了 `libvold.a` 却只继承了这个静态库本身，依赖表没跟过来。
+
+**这是链接错误，不是模块缺失**，`ALLOW_MISSING_DEPENDENCIES` 依然无效。
+
+修法：新增 `scripts/fix_libtar_link.py`，在 `Android.mk` 的 `ifeq ($(TW_INCLUDE_CRYPTO_FBE), true)` 分支（也就是 `libvold` 真正被链接的分支）追加两行：
+
+```make
+LOCAL_STATIC_LIBRARIES += libasync_safe
+LOCAL_SHARED_LIBRARIES += libboot_control_client libsysutils
+```
+
+- 只改 shared library 那一段（`libtar_static` 不链 `libvold`，不需要）；
+- 三个库名按整词判重，已存在则不重复添加；
+- 带 `# [twrp-builder-fix]` 标记，重复执行直接跳过；
+- 找不到 `Android.mk`、没有 `TW_INCLUDE_CRYPTO_FBE` 分支、或该分支没链 `libvold` 时静默退出（退出码 0）。
+
+验证：拿 TWRP `android-14.1` 真实的 `libtar/Android.mk` 跑脚本，`make` 解析出的变量为
+
+```
+STATIC_LIBS = libasync_safe libvold libscrypt_static ...
+SHARED_LIBS = ... libboot_control_client libsysutils android.hardware.boot@1.0 ...
+```
+
+重复执行无二次修改。
+
 ## 四、怎么用
 
 二选一：
