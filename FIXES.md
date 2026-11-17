@@ -383,6 +383,34 @@ LOCAL_SHARED_LIBRARIES += libz libc libcutils ... libtwadbbu libsysutils
 
 验证：用 TWRP 真实 `Android.mk` 跑，diff 只有一行、单空格、追加在行尾；重复执行输出“已含 libsysutils，无需修改”；`Android.mk` 不存在时静默退出。
 
+### 17. `make` 退出码 0，但 `Collect outputs` 报“没有生成任何 .img”
+
+**现象**
+
+```
+===== 产物目录：out/target/product/twrp_PD2551 =====
+Error: 没有生成任何 .img，请检查上面的编译日志
+Error: Process completed with exit code 1.
+```
+
+编译那一步是绿的，打包这一步才炸。
+
+**根因**：`vendorbootimage` 在 `build/make/core` 里是按 `BOARD_USES_VENDOR_BOOTIMAGE` 条件定义的。设备树没开这个开关时，这个目标仍然存在但**既没有依赖也没有配方**，`make` 只会打印
+
+```
+make: Nothing to be done for 'vendorbootimage'.
+```
+
+然后 `exit 0`。ninja 压根没跑打包，`out/target/product/<product>/` 里自然一个 `.img` 都没有——这不是编译失败，是**目标名和设备真实分区对不上**。
+
+**改法**（`Recovery Build.yml`，三处）：
+
+1. 构建前用 `get_build_var BOARD_USES_VENDOR_BOOTIMAGE` 探测，未开启时把 `MAKE_TARGET` 从 `vendorbootimage` 自动切到 `bootimage`，并打 `::warning::`；
+2. `make` 之后立刻自检产物目录：返回 0 但 0 个 `.img` 时，打印 `build.log` 尾部 + `Nothing to be done` 检测结果 + `out/target/product` 目录列表，然后按 `bootimage → recoveryimage → vendorbootimage → droid` 逐级补编（对象都在，补编只是打包，很快）；
+3. `Collect outputs` 不再硬拼 `out/target/product/$TARGET_PRODUCT`，改用 `get_build_var PRODUCT_OUT`；找不到就在 `out/target/product` 下全量搜索 `.img`（>1MB），统一收口到 `dist/`，artifact / Release 都只从 `dist/` 取。
+
+**顺带说清楚**：`BUILD_TARGET` 要填设备**真实有**的那个分区。vivo 这类把 recovery 塞进 `boot` 的机型填 `boot`；确实有独立 `vendor_boot` 分区（GKI 机型常见）才填 `vendorboot`。
+
 ## 四、怎么用
 
 二选一：
