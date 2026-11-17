@@ -260,17 +260,30 @@ AOSP 14 的 `build/soong/fsgen` 会为每个 `BOARD_AVB_VBMETA_*` 分区准备�
 修法：新增 `scripts/fix_device_avb.py`，在 `Patch device tree` 步骤里扫描设备树所有 `BoardConfig*.mk`：
 
 - 找出所有 `BOARD_AVB_VBMETA_<X> := ...` 声明（排除 `_KEY_PATH` / `_ALGORITHM` / `_ROLLBACK_INDEX` 等属性变量）；
-- 对缺 `BOARD_AVB_VBMETA_<X>_KEY_PATH` 的，按设备树已有的 `BOARD_AVB_VENDOR_BOOT_KEY_PATH` 补齐（没有则用 `external/avb/test/data/testkey_rsa2048.pem`）；`_ALGORITHM` 同理跟随 `BOARD_AVB_VENDOR_BOOT_ALGORITHM`；
-- 只补 `KEY_PATH` 与 `ALGORITHM`，不碰 rollback index，避免改变设备原有的回滚语义；
-- 幂等（`# [twrp-builder-fix]` 标记），没有 chained 分区或没有 `BoardConfig` 时静默退出。
+- 按 `build/make/core/Makefile` 里 `add-vbmeta-image` 的四项非空校验逐个补齐，缺哪个补哪个：
+  - `_KEY_PATH` 跟随设备树已有的 `BOARD_AVB_VENDOR_BOOT_KEY_PATH`（没有则用 `external/avb/test/data/testkey_rsa2048.pem`）；
+  - `_ALGORITHM` 跟随 `BOARD_AVB_VENDOR_BOOT_ALGORITHM`（没有则 `SHA256_RSA2048`）；
+  - `_ROLLBACK_INDEX := 0`；
+  - `_ROLLBACK_INDEX_LOCATION` 取一个未被占用的编号（从 1 开始，跳过设备树里已有的值）；
+- 幂等：缺什么补什么，四项齐全就不动文件；没有 chained 分区或没有 `BoardConfig` 时静默退出。
 
-对当前 PD2551 设备树的实际效果是追加三行：
+对当前 PD2551 设备树的实际效果是追加四行：
 
 ```make
 # [twrp-builder-fix] chained vbmeta 分区的签名 key
 BOARD_AVB_VBMETA_SYSTEM_KEY_PATH := external/avb/test/data/testkey_rsa2048.pem
 BOARD_AVB_VBMETA_SYSTEM_ALGORITHM := SHA256_RSA2048
+BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX := 0
+BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX_LOCATION := 1
 ```
+
+**第二轮**：只补 `KEY_PATH` / `ALGORITHM` 时 soong 能过，但 make 阶段会接着报
+
+```
+build/make/core/Makefile:4815: error: BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX is not defined.
+```
+
+因为 `add-vbmeta-image` 对四个变量都做了 `$(if ...)` 非空校验，缺一个就 `$(error)`。所以脚本改成四项全覆盖。
 
 ## 四、怎么用
 

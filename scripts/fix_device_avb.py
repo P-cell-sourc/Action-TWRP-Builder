@@ -27,17 +27,22 @@ AOSP 14 的 soong 在解析 Android.bp 阶段会跑 build/soong/fsgen，
 做法
 ----
 扫描设备树里所有 BoardConfig*.mk，找出 BOARD_AVB_VBMETA_<X> 的定义，
-若对应的 BOARD_AVB_VBMETA_<X>_KEY_PATH 不存在，就按下面规则补上：
+按 build/make/core/Makefile 里 add-vbmeta-image 的四项非空校验逐个补齐：
 
-    key     = 设备树里已有的 BOARD_AVB_VENDOR_BOOT_KEY_PATH
-              （没有就用 external/avb/test/data/testkey_rsa2048.pem）
-    algorithm = 设备树里已有的 BOARD_AVB_VENDOR_BOOT_ALGORITHM
-              （没有就用 SHA256_RSA2048）
+    BOARD_AVB_<X>_KEY_PATH              <- BOARD_AVB_VENDOR_BOOT_KEY_PATH
+                                           （没有就用 external/avb/test/data/testkey_rsa2048.pem）
+    BOARD_AVB_<X>_ALGORITHM             <- BOARD_AVB_VENDOR_BOOT_ALGORITHM
+                                           （没有就用 SHA256_RSA2048）
+    BOARD_AVB_<X>_ROLLBACK_INDEX        <- 0
+    BOARD_AVB_<X>_ROLLBACK_INDEX_LOCATION <- 取一个未被占用的编号（从 1 开始）
 
-只加 KEY_PATH 与 ALGORITHM 两个变量：fsgen 只要求这两项，
-rollback index 之类保持缺省，避免影响设备原有的回滚语义。
+四个变量缺任意一个，make 阶段都会直接 $(error)：
 
-幂等：带固定标记注释；找不到 BoardConfig 或没有 chained 分区时静默退出。
+    build/make/core/Makefile:4815: error:
+      BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX is not defined.
+
+幂等：缺什么补什么，全部齐了就不动文件；找不到 BoardConfig 或没有
+chained 分区时静默退出。
 """
 
 import os
@@ -96,10 +101,6 @@ def process_tree(tree: Path) -> int:
 
     combined = "\n".join(f.read_text(encoding="utf-8", errors="surrogateescape") for f in files)
 
-    if MARKER in combined:
-        print("设备树 AVB：%s 已处理过，跳过" % tree)
-        return 0
-
     chained = []
     for line in combined.splitlines():
         m = CHAIN_RE.match(line)
@@ -118,20 +119,41 @@ def process_tree(tree: Path) -> int:
     key = get_var(combined, "BOARD_AVB_VENDOR_BOOT_KEY_PATH") or DEFAULT_KEY
     algorithm = get_var(combined, "BOARD_AVB_VENDOR_BOOT_ALGORITHM") or DEFAULT_ALGORITHM
 
+    # rollback index location 必须在整机范围内唯一，先收集已被占用的编号
+    used_locations = set()
+    for m in re.finditer(r"^\s*BOARD_AVB_[A-Z0-9_]+_ROLLBACK_INDEX_LOCATION\s*[:+]?=\s*(\d+)", combined, re.M):
+        used_locations.add(int(m.group(1)))
+
+    def next_location():
+        n = 1
+        while n in used_locations:
+            n += 1
+        used_locations.add(n)
+        return n
+
+    # build/make/core/Makefile 的 add-vbmeta-image 对四个变量都做了非空校验，
+    # 缺任何一个都会 $(error)，所以逐个检查、缺什么补什么。
     blocks = []
     added = []
     for name in chained:
         full = "BOARD_AVB_" + name
-        if var_defined(combined, full + "_KEY_PATH"):
-            continue
-        lines = ["", MARKER, "%s_KEY_PATH := %s" % (full, key)]
+        lines = []
+        if not var_defined(combined, full + "_KEY_PATH"):
+            lines.append("%s_KEY_PATH := %s" % (full, key))
         if not var_defined(combined, full + "_ALGORITHM"):
             lines.append("%s_ALGORITHM := %s" % (full, algorithm))
-        blocks.append("\n".join(lines))
+        if not var_defined(combined, full + "_ROLLBACK_INDEX"):
+            lines.append("%s_ROLLBACK_INDEX := 0" % full)
+        if not var_defined(combined, full + "_ROLLBACK_INDEX_LOCATION"):
+            lines.append("%s_ROLLBACK_INDEX_LOCATION := %d" % (full, next_location()))
+        if not lines:
+            continue
+        head = MARKER if MARKER not in combined else MARKER + "（补充）"
+        blocks.append("\n".join([""] + [head] + lines))
         added.append(name)
 
     if not blocks:
-        print("设备树 AVB：%s 的 chained 分区都已有 key，无需修改" % tree)
+        print("设备树 AVB：%s 的 chained 分区配置完整，无需修改" % tree)
         return 0
 
     text = main.read_text(encoding="utf-8", errors="surrogateescape")
@@ -141,8 +163,9 @@ def process_tree(tree: Path) -> int:
     main.write_text(text, encoding="utf-8", errors="surrogateescape")
 
     print("设备树 AVB：已写入 %s" % main)
-    for name in added:
-        print("  BOARD_AVB_%s_KEY_PATH := %s" % (name, key))
+    for line in "\n".join(blocks).splitlines():
+        if line.strip().startswith("BOARD_AVB_"):
+            print("  " + line.strip())
     return 0
 
 
