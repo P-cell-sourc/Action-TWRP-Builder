@@ -1,10 +1,20 @@
 name: Recovery Build
 
+# ──────────────────────────────────────────────────────────────────────
+# 运行环境：Ubuntu 22.04（Jammy）
+#   AOSP 14 / TWRP 14.1 官方支持矩阵是 20.04 / 22.04。24.04（Noble）虽然也能跑，
+#   但会带来一批额外噪音：libncurses5 被移除、python 3.12 与部分 soong 脚本不兼容、
+#   linux-modules-extra 版本对不上导致 apt 直接失败。换成 22.04 后这些都不存在。
+#
+# 软件源：清华 TUNA 镜像（apt）。repo 工具也优先从 TUNA 下载，
+#   官方 storage.googleapis.com 在国内经常超时。
+# ──────────────────────────────────────────────────────────────────────
+
 on:
   workflow_dispatch:
     inputs:
       MANIFEST_URL:
-        description: 'MANIFEST_URL (if want to use SSH keys, use git@github.com:XXXXX)'
+        description: 'MANIFEST_URL（用 SSH 就填 git@github.com:XXX）'
         required: true
         default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
       MANIFEST_BRANCH:
@@ -36,7 +46,7 @@ on:
         required: false
         default: ''
       DEVICE_NAME:
-        description: 'DEVICE_NAME（必须与 lunch 出来的 TARGET_PRODUCT 一致，产物在 out/target/product/<DEVICE_NAME>）'
+        description: 'DEVICE_NAME（必须与 lunch 出的 TARGET_PRODUCT 一致）'
         required: true
         default: 'PD2551'
       MAKEFILE_NAME:
@@ -48,13 +58,17 @@ on:
         required: true
         default: 'vendorboot'
       JAVA_VERSION:
-        description: 'JAVA_VERSION（twrp-14.x 用 17；twrp-11 / twrp-12.1 用 11；Android 10 及更早用 8）'
+        description: 'JAVA_VERSION（twrp-14.x 用 17；11/12.1 用 11；Android 10 及更早用 8）'
         required: true
         default: '17'
       BUILD_JOBS:
-        description: 'BUILD_JOBS（make -j 并发数，0 = 按内存自动：约每 4GB 内存 1 个并发）'
+        description: 'BUILD_JOBS（make -j，0 = 按内存自动：约每 4GB 1 个并发）'
         required: false
         default: '0'
+      ENABLE_CCACHE:
+        description: 'ENABLE_CCACHE（true = 启用 ccache + 缓存，重复构建快很多）'
+        required: false
+        default: 'true'
 
 concurrency:
   group: recovery-build-${{ github.ref }}
@@ -63,7 +77,8 @@ concurrency:
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
     permissions:
       contents: write
     steps:
@@ -72,7 +87,8 @@ jobs:
     # ──────────────────────────────────────────────────────────────
     - name: Display Run Parameters
       run: |
-        echo "::group::User Environment Variables"
+        echo "::group::Run Parameters"
+        echo "Runner                : ubuntu-22.04"
         echo "Manifest URL          : ${{ inputs.MANIFEST_URL }}"
         echo "Manifest Branch       : ${{ inputs.MANIFEST_BRANCH }}"
         echo "Device Tree URL       : ${{ inputs.DEVICE_TREE_URL }}"
@@ -89,38 +105,57 @@ jobs:
     - name: Check Out
       uses: actions/checkout@v4
 
-    # 释放磁盘 + 精简镜像（这一步会清掉大量预装 SDK）
-    - name: Cleanup
+    # 释放 ~20GB：AOSP out/ 至少需要 30GB，标准 runner 只有 70GB 左右
+    - name: Free disk space
       uses: rokibhasansagar/slimhub_actions@main
 
     # ──────────────────────────────────────────────────────────────
-    # 1. 依赖环境（原脚本的失败点）
-    #    修复：去掉 linux-modules-extra-$(uname -r)（noble 上没有对应版本，apt 直接退出 100）
-    #          去掉 apt upgrade -y（既慢又可能换内核/删掉 runner 自带工具）
-    #          apt update 允许失败，批量安装失败则退化为逐个安装并定位问题包
+    # 1. 编译环境（清华源 + Ubuntu 22.04 依赖集）
+    #    22.04 上 libncurses5 / libtinfo5 仍然存在，prebuilt clang 能直接跑；
+    #    不需要 linux-modules-extra（那个包在 24.04 上根本没有对应版本）。
     # ──────────────────────────────────────────────────────────────
-    - name: Prepare the environment
+    - name: Prepare the environment (TUNA mirror)
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         set -uo pipefail
 
+        # ── 换成清华源 ──
+        #   GitHub 托管 runner 默认用 azure.archive.ubuntu.com，国内拉取极慢。
+        #   22.04 用 /etc/apt/sources.list，24.04 改成 deb822 的 ubuntu.sources，
+        #   两个都处理一遍，镜像升级了也不会失效。
+        echo "::group::switch to TUNA mirror"
+        if [ -f /etc/apt/sources.list ]; then
+          sudo cp -f /etc/apt/sources.list /etc/apt/sources.list.bak
+          sudo sed -i -E \
+            's|https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
+            /etc/apt/sources.list
+        fi
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          sudo cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak
+          sudo sed -i -E \
+            's|https?://(archive|security|azure\.archive)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+        fi
+        grep -rhoE "https?://[^ ]*ubuntu[^ ]*" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | sort -u || true
+        echo "::endgroup::"
+
         APT_OPTS="-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=5"
 
         echo "::group::apt update"
         if ! sudo -E apt-get update $APT_OPTS; then
-          echo "::warning::apt update 未完全成功（常见于镜像内第三方源 403/签名失效），继续尝试安装"
+          echo "::warning::apt update 未完全成功（第三方源 403/签名失效很常见），继续安装"
         fi
         echo "::endgroup::"
 
-        # 编译 TWRP 真正需要的包
+        # AOSP 14 在 Ubuntu 22.04 上真正需要的包
         REQUIRED="
           git git-lfs curl ca-certificates unzip zip rsync tree
           bc bison flex gperf ccache make build-essential
           gcc-multilib g++-multilib
-          gcc-10-multilib g++-10-multilib libstdc++-10-dev
           libc6-dev lib32ncurses-dev lib32readline-dev lib32z1-dev
-          libncurses-dev libxml2-utils xsltproc libx11-dev x11proto-core-dev
+          libncurses-dev libncurses5 libtinfo5
+          libxml2-utils xsltproc libx11-dev x11proto-core-dev
           libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev libgtk-3-dev libsdl1.2-dev
           imagemagick libbz2-dev zlib1g-dev libssl-dev lzma lzop lz4
           squashfs-tools schedtool pngcrush ncftp qemu-user-static
@@ -130,7 +165,7 @@ jobs:
         echo "::group::apt install (batch)"
         if ! sudo -E apt-get install $APT_OPTS --no-install-recommends $REQUIRED; then
           echo "::endgroup::"
-          echo "::warning::批量安装失败，切换为逐包安装以定位缺失的包"
+          echo "::warning::批量安装失败，改为逐包安装以定位问题包"
           echo "::group::apt install (per package)"
           FAILED=""
           for p in $REQUIRED; do
@@ -142,26 +177,31 @@ jobs:
             fi
           done
           echo "::endgroup::"
-          if [ -n "$FAILED" ]; then
-            echo "::warning::以下包未能安装：$FAILED（若不影响编译可忽略）"
-          fi
+          [ -n "$FAILED" ] && echo "::warning::未能安装：$FAILED（不影响编译的可忽略）"
         else
           echo "::endgroup::"
         fi
 
-        # 关键包兜底校验：这几个缺了必然编不过，早失败早报错
+        # 硬性校验：这几个缺了必然编不过，早失败比跑 40 分钟再失败划算
         echo "::group::verify toolchain"
         MISSING=""
-        for p in git bc gperf make ccache build-essential; do
+        for p in git bc gperf make ccache build-essential libssl-dev zlib1g-dev; do
           dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
         done
+        if dpkg -s libncurses5 >/dev/null 2>&1 || dpkg -s libncurses6 >/dev/null 2>&1; then
+          echo "ncurses: ok"
+        else
+          MISSING="$MISSING libncurses5"
+        fi
         if [ -n "$MISSING" ]; then
           echo "::error::关键依赖缺失：$MISSING"
           exit 1
         fi
-        { gcc --version | head -1; } || true
+        lsb_release -ds 2>/dev/null || cat /etc/os-release | head -2
+        gcc --version | head -1
         python3 --version
-        df -h / /home 2>/dev/null || df -h / || true
+        free -h || true
+        df -h / || true
         echo "::endgroup::"
 
     - name: Install OpenJDK
@@ -181,27 +221,25 @@ jobs:
           ${{ secrets.SSH_PRIVATE_KEY }}
 
     # ──────────────────────────────────────────────────────────────
-    # 2. repo 工具
+    # 2. repo 工具（清华镜像优先）
     # ──────────────────────────────────────────────────────────────
     - name: Install repo
       run: |
         set -euo pipefail
         mkdir -p "$HOME/bin"
         if ! curl -fsSL --retry 5 --retry-delay 3 \
-              -o "$HOME/bin/repo" https://storage.googleapis.com/git-repo-downloads/repo; then
-          echo "::warning::官方地址下载失败，改用清华镜像"
+              -o "$HOME/bin/repo" https://mirrors.tuna.tsinghua.edu.cn/git/git-repo; then
+          echo "::warning::清华镜像失败，回落到官方地址"
           curl -fsSL --retry 5 --retry-delay 3 \
-              -o "$HOME/bin/repo" https://mirrors.tuna.tsinghua.edu.cn/git/git-repo
+              -o "$HOME/bin/repo" https://storage.googleapis.com/git-repo-downloads/repo
         fi
         chmod +x "$HOME/bin/repo"
         sudo ln -sf "$HOME/bin/repo" /usr/local/bin/repo
         echo "$HOME/bin" >> "$GITHUB_PATH"
-        repo --version | head -3 || true
+        repo --version | head -2 || true
 
     # ──────────────────────────────────────────────────────────────
     # 3. 初始化 + 同步源码
-    #    原脚本 bug：mkdir workspace 前没有判断目录是否存在；repo sync 无重试；
-    #                echo 到 $GITHUB_OUTPUT 的步骤 id 写在 run 里但 working-directory 缺失
     # ──────────────────────────────────────────────────────────────
     - name: Initialize repo
       id: pwd
@@ -212,8 +250,9 @@ jobs:
         echo "workspace-folder=$PWD" >> "$GITHUB_OUTPUT"
         git config --global user.name  "Nico170420"
         git config --global user.email "b170420nc@gmail.com"
-        # 避免 repo 在 CI 里因为 tty 卡住
         git config --global --add safe.directory '*'
+        # repo 在非交互环境下别去问 tty
+        export GIT_TERMINAL_PROMPT=0
 
         for attempt in 1 2 3; do
           if repo init --depth=1 --no-clone-bundle \
@@ -233,6 +272,7 @@ jobs:
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
         set -uo pipefail
+        export GIT_TERMINAL_PROMPT=0
         for attempt in 1 2 3; do
           if repo sync -j"$(nproc --all)" -c --force-sync --no-clone-bundle --no-tags; then
             echo "repo sync 成功（第 $attempt 次尝试）"
@@ -246,12 +286,11 @@ jobs:
 
     # ──────────────────────────────────────────────────────────────
     # 3.5 补回 external/guava
-    #     ALLOW_MISSING_DEPENDENCIES=true 时，缺失模块不会在解析期报错，而是变成
+    #     ALLOW_MISSING_DEPENDENCIES=true 时缺模块不会在解析期报错，而是变成
     #     构建期必然失败的占位规则：
-    #       module unsupportedappusage-annotation-processor-lib
+    #       module ...unsupportedappusage-annotation-processor-lib
     #         missing dependencies: guava
-    #     guava 出自 external/guava（TWRP 的 remove-minimal.xml 会 remove 掉它）。
-    #     缺失时按清单里的 remote/revision 重新加回并 sync，只告警不中断。
+    #     guava 出自 external/guava，TWRP 的 remove-minimal.xml 会把它 remove 掉。
     # ──────────────────────────────────────────────────────────────
     - name: Ensure external/guava (host java dependency)
       continue-on-error: true
@@ -299,8 +338,9 @@ jobs:
         rm -rf "$C"
         git clone --depth 1 -b "$BRANCH" "${{ inputs.COMMON_TREE_URL }}" "$C"
 
-    # 旧版 twrpdtgen 模板生成的设备树会继承已被 AOSP 删除的配置，
-    # 这类问题在 lunch 阶段只会打印一句 "xxx does not exist"，很难定位，这里提前修掉。
+    # ──────────────────────────────────────────────────────────────
+    # 4.5 修设备树（twrpdtgen 模板常见问题）
+    # ──────────────────────────────────────────────────────────────
     - name: Patch device tree
       continue-on-error: true
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
@@ -312,8 +352,7 @@ jobs:
         for D in $TREES; do
           [ -d "$D" ] || { echo "::warning::目录不存在，跳过：$D"; continue; }
 
-          # (1) target/product/embedded.mk 在 Android 9 之后被 AOSP 删除，
-          #     现在等价的最小配置是 base.mk，否则 lunch 直接报 does not exist
+          # (1) target/product/embedded.mk 在 Android 9 之后被删除，等价的最小配置是 base.mk
           for f in $(grep -rl "product/embedded\.mk" "$D" --include="*.mk" 2>/dev/null); do
             sed -i -E 's@\$\(SRC_TARGET_DIR\)/product/embedded\.mk@$(SRC_TARGET_DIR)/product/base.mk@g' "$f"
             sed -i -E 's@build/make/target/product/embedded\.mk@$(SRC_TARGET_DIR)/product/base.mk@g' "$f"
@@ -328,25 +367,19 @@ jobs:
         done
 
         # (3) 可选分区的输出路径
-        #     build/make/core/board_config.mk 的 check_image_config 规定：
-        #     只要声明了 BOARD_<P>IMAGE_FILE_SYSTEM_TYPE（或 PREBUILT），
-        #     就必须把该分区设为独立输出 TARGET_COPY_OUT_<P> := <P>，否则直接 $(error)。
-        #     设备树模板常只补 vendor/product/odm/vendor_dlkm，漏掉 system_ext，
-        #     lunch 就会报 TARGET_COPY_OUT_SYSTEM_EXT must be set to system_ext。
+        #     board_config.mk 的 check_image_config：声明了 BOARD_<P>IMAGE_FILE_SYSTEM_TYPE
+        #     就必须设 TARGET_COPY_OUT_<P> := <P>，否则 lunch 直接 $(error)。
         python3 "$GITHUB_WORKSPACE/scripts/fix_copy_out.py" \
           "${{ inputs.DEVICE_PATH }}" "${{ inputs.COMMON_PATH }}" \
           || echo "::warning::COPY_OUT 自动修复未完成，继续尝试编译"
 
-        # (3.5) chained vbmeta 分区的签名 key
-        #     AOSP 14 的 soong fsgen 会为 BOARD_AVB_VBMETA_* 声明的每个分区准备签名参数，
-        #     只写 BOARD_AVB_VBMETA_SYSTEM := system 却没给 KEY_PATH 时直接抛：
-        #       No key found for chained avb partition "vbmeta_system"
-        #     报错发生在 soong bootstrap 阶段（编译 1 分钟就退出），很像环境问题，
-        #     实际是设备树配置不全。按已有的 vendor_boot key 补齐。
+        # (4) chained vbmeta 分区的四个签名变量
+        #     soong fsgen 要求 KEY_PATH，make 的 add-vbmeta-image 还额外要求
+        #     ALGORITHM / ROLLBACK_INDEX / ROLLBACK_INDEX_LOCATION，缺一个就 $(error)。
         python3 "$GITHUB_WORKSPACE/scripts/fix_device_avb.py" $TREES \
-          || echo "::warning::chained AVB key 自动补全未完成，继续尝试编译"
+          || echo "::warning::chained AVB 变量自动补全未完成，继续尝试编译"
 
-        # (4) 预检：设备树继承的每个 $(SRC_TARGET_DIR)/product/*.mk 在源码里是否真的存在
+        # (5) 预检：设备树继承的 $(SRC_TARGET_DIR)/product/*.mk 是否真的存在
         MISSING=""
         REFS=0
         for ref in $(grep -rhoE '\$\(SRC_TARGET_DIR\)/product/[A-Za-z0-9_.-]+' $TREES --include="*.mk" 2>/dev/null | sort -u); do
@@ -357,11 +390,11 @@ jobs:
           fi
         done
         if [ -n "$MISSING" ]; then
-          echo "::warning::设备树继承了源码中不存在的产品配置：$MISSING（后续 lunch/make 很可能失败）"
+          echo "::warning::设备树继承了源码中不存在的产品配置：$MISSING（lunch/make 很可能失败）"
         elif [ "$REFS" -eq 0 ]; then
           echo "设备树未引用 SRC_TARGET_DIR 下的产品配置，跳过继承预检"
         else
-          echo "继承预检通过：$REFS 个 SRC_TARGET_DIR 引用全部存在"
+          echo "继承预检通过：$REFS 个引用全部存在"
         fi
 
     # ──────────────────────────────────────────────────────────────
@@ -400,11 +433,7 @@ jobs:
         repo sync -j"$(nproc --all)" -c --force-sync --no-clone-bundle --no-tags || true
 
     # ──────────────────────────────────────────────────────────────
-    # 5.5 swap
-    #     标准 runner 只有 16GB 内存，AOSP 编译峰值会吃满并触发 OOM，
-    #     而 OOM 杀掉 runner agent 的表现就是 “lost communication with the server”。
-    #     但 swap 文件写在同一块盘上，开太大先把磁盘吃满同样会让 runner 失联，
-    #     所以这里按“可用磁盘的 1/4”封顶，且失败不中断。
+    # 5.5 swap：16GB runner 靠 swap 把 RAM+swap 补到 28GB 左右
     # ──────────────────────────────────────────────────────────────
     - name: Set up swap
       continue-on-error: true
@@ -413,10 +442,7 @@ jobs:
         MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
         FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
         echo "内存 ${MEM_GB}GB / 根分区可用 ${FREE_GB}GB"
-        # 社区经验：编译 AOSP 时 RAM + swap 至少要到 32GB，
-        # 16GB 内存的 runner 靠 swap 补齐（12GB → 合计 28GB）
         WANT=12
-        # 给 out/ 预留 16GB，剩下的才拿来当 swap
         MAX=$(( FREE_GB - 16 ))
         SIZE=$(( WANT < MAX ? WANT : MAX ))
         if [ "$SIZE" -lt 2 ]; then
@@ -433,18 +459,42 @@ jobs:
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile >/dev/null
         sudo swapon /swapfile
-        # 编译时希望内核愿意把冷页换出去（60 是默认值，
-        # 之前设成 10 会让内存吃紧时优先 OOM 而不是换出）
         sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
         free -h
         df -h /
 
     # ──────────────────────────────────────────────────────────────
-    # 5.6 soong_build 内存上限透传
+    # 5.6 ccache：不改产物，只让第二次构建快 3~5 倍
+    # ──────────────────────────────────────────────────────────────
+    - name: Restore ccache
+      if: ${{ inputs.ENABLE_CCACHE == 'true' }}
+      continue-on-error: true
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-
+
+    - name: Configure ccache
+      if: ${{ inputs.ENABLE_CCACHE == 'true' }}
+      run: |
+        set -uo pipefail
+        mkdir -p "$HOME/.ccache"
+        ccache -M 4G >/dev/null 2>&1 || true
+        ccache -z >/dev/null 2>&1 || true
+        {
+          echo "USE_CCACHE=1"
+          echo "CCACHE_DIR=$HOME/.ccache"
+          echo "CCACHE_COMPRESS=1"
+          echo "CCACHE_COMPILERCHECK=content"
+        } >> "$GITHUB_ENV"
+        ccache -s || true
+
+    # ──────────────────────────────────────────────────────────────
+    # 5.7 soong_build 内存上限透传
     #     build/soong/ui/build/soong.go 用 `env -i` 启动 soong_build，
-    #     父进程环境被清空，shell 里 export 的 GOMEMLIMIT/GOGC 传不进去，
-    #     结果就是解析 Android.bp 阶段（日志停在 cp soong_build 之后）
-    #     堆一路涨到被内核 OOM 杀掉。这里给源码打一个小补丁。
+    #     shell 里 export 的 GOMEMLIMIT/GOGC 传不进去，解析阶段堆涨到被 OOM。
     # ──────────────────────────────────────────────────────────────
     - name: Patch soong_build memory limit propagation
       continue-on-error: true
@@ -455,12 +505,10 @@ jobs:
           || echo "::warning::未能打上 GOMEMLIMIT 透传补丁"
 
     # ──────────────────────────────────────────────────────────────
-    # 5.7 去掉已废弃的 -ndk_platform AIDL 后端后缀
-    #     AOSP 已删除 "*-ndk_platform.so"（build/make/target/product/gsi/
-    #     Android.mk 原文：libraries no longer exist），但 bootable/recovery 的
-    #     TW_INCLUDE_CRYPTO_FBE 分支仍在用旧名字，链接 libtar 时报：
-    #       android.security.apc-ndk_platform.so.toc, needed by libtar.so,
-    #       missing and no known rule to make it
+    # 5.8 去掉已废弃的 -ndk_platform 后缀
+    #     AOSP 已删除 *-ndk_platform.so，但 bootable/recovery 的
+    #     TW_INCLUDE_CRYPTO_FBE 分支还在用旧名字，链接时报
+    #     "missing and no known rule to make it"。
     # ──────────────────────────────────────────────────────────────
     - name: Patch recovery makefiles (removed ndk_platform AIDL backend)
       continue-on-error: true
@@ -471,16 +519,11 @@ jobs:
           || echo "::warning::-ndk_platform 后缀修补未完成，libtar 链接可能再次失败"
 
     # ──────────────────────────────────────────────────────────────
-    # 6.4 libtar 的 fscrypt 兼容层
-    #     TWRP 14.1 的两个仓库不同步：
-    #       system/vold @android-14.1 把 fscrypt_policy.h 换成了 v1/v2 接口，
-    #       删掉了 union fscrypt_policy 和 get_policy 等 5 个 helper；
-    #       而 bootable/recovery @android-14.1 的 libtar 还在用旧接口。
-    #     再加上 bionic 的 <linux/fscrypt.h> 有
-    #       #define fscrypt_policy fscrypt_policy_v1
-    #     这个宏会把 libtar 里的类型名整个改写，C 下直接报
-    #       "must use 'struct' tag to refer to type 'fscrypt_policy_v1'"。
-    #     → 生成 fscrypt_compat.h 补回旧 API，只改 include 行。
+    # 5.9 libtar 的 fscrypt 兼容层
+    #     TWRP 14.1 两个仓库不同步：vold 改成了 fscrypt_policy_v1/v2 两套接口，
+    #     删掉了 union fscrypt_policy 和 get_policy 等 helper，libtar 还在用旧的。
+    #     再叠加 bionic 的 #define fscrypt_policy fscrypt_policy_v1，
+    #     C 下直接报 "must use 'struct' tag to refer to type ..."。
     # ──────────────────────────────────────────────────────────────
     - name: Patch libtar fscrypt API (TWRP 14.1 vold mismatch)
       continue-on-error: true
@@ -491,14 +534,10 @@ jobs:
           || echo "::warning::libtar fscrypt 兼容层未写入，编译可能再次失败"
 
     # ──────────────────────────────────────────────────────────────
-    # 6.5 libtar 链接依赖
-    #     libtar 用 LOCAL_STATIC_LIBRARIES += libvold 把整个 vold 静态库链进来，
-    #     但 AOSP 14 的 vold 新增了三个依赖，libtar 的 Android.mk 还停在 12：
-    #       Checkpoint.cpp    -> android::hal::BootControlClient::WaitForService()
-    #       VolumeManager.cpp -> NetlinkEvent::dump() / findParam()
-    #       VolumeManager.cpp -> async_safe_format_log()
-    #     → 补 libboot_control_client / libsysutils（shared）与 libasync_safe（static），
-    #       与 system/vold/Android.bp 的 vold_default_libs 对齐。
+    # 5.10 libtar 链接依赖
+    #      libtar 用 LOCAL_STATIC_LIBRARIES += libvold 复用 vold 的实现，
+    #      但 AOSP 14 的 vold 多了三个依赖（libboot_control_client /
+    #      libsysutils / libasync_safe），libtar 的 Android.mk 还停在 12。
     # ──────────────────────────────────────────────────────────────
     - name: Patch libtar link libraries (vold 14 deps)
       continue-on-error: true
@@ -510,14 +549,12 @@ jobs:
 
     # ──────────────────────────────────────────────────────────────
     # 6. 编译
-    #    原脚本只试 <MAKEFILE_NAME>-eng，twrp-14/15 源的 release 段名不同，必须探测
     # ──────────────────────────────────────────────────────────────
     - name: Building recovery
       id: build
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
-        # 注意：这里不能用 set -u。AOSP 的 build/envsetup.sh 会引用未定义变量
-        # （如 $TOP），在 nounset 下会直接 `TOP: unbound variable` 退出。
+        # 不能用 set -u：build/envsetup.sh 会引用未定义变量（如 $TOP）
         set -o pipefail
         set +u
         source build/envsetup.sh
@@ -528,7 +565,7 @@ jobs:
         MK="${{ inputs.MAKEFILE_NAME }}"
         TARGET="${{ inputs.BUILD_TARGET }}"
 
-        # make 目标名与产物名并不相同：vendorbootimage -> vendor_boot.img
+        # make 目标名与产物名不同：vendorbootimage -> vendor_boot.img
         case "$TARGET" in
           vendorboot|vendor_boot|vendor-boot) MAKE_TARGET="vendorbootimage" ;;
           boot)                               MAKE_TARGET="bootimage" ;;
@@ -537,7 +574,7 @@ jobs:
         esac
         echo "make 目标：$MAKE_TARGET"
 
-        # 枚举源码里实际存在的 release 配置（Android 13+ 的 lunch 变成三段式）
+        # Android 13+ 的 lunch 是三段式：<product>-<release>-<variant>
         RELS=""
         if [ -d build/release/release_configs ]; then
           RELS=$(ls build/release/release_configs 2>/dev/null | sed 's/\.[^.]*$//' | sort -u)
@@ -569,7 +606,7 @@ jobs:
           echo "===== 所有 AndroidProducts.mk ====="; find device -maxdepth 4 -name AndroidProducts.mk || true
           echo "===== 源码里的 release 配置目录 ====="; ls build/release/release_configs 2>/dev/null || echo "(不存在)"
           echo "===== 最后一次 lunch 尝试的完整输出 ====="; cat "$LUNCH_ERR" || true
-          echo "===== 设备树 BoardConfig 里的分区/输出配置 ====="
+          echo "===== 设备树 BoardConfig 分区/输出配置 ====="
           grep -nE "TARGET_COPY_OUT_|BOARD_[A-Z0-9_]+IMAGE_(FILE_SYSTEM_TYPE|PARTITION_SIZE)|BOARD_[A-Z0-9_]+_LIST" "${{ inputs.DEVICE_PATH }}/BoardConfig.mk" 2>/dev/null || true
           exit 1
         fi
@@ -580,9 +617,8 @@ jobs:
         echo "TARGET_PRODUCT=$PRODUCT"
         echo "product=$PRODUCT" >> "$GITHUB_OUTPUT"
 
-        # 并行度必须按内存算：-j$(nproc) 在 16GB runner 上会让并行编译的
-        # clang/lld 把内存吃穿，OOM killer 杀掉 runner agent → 任务报
-        # “lost communication with the server”，日志断在半截。
+        # 并发按内存算：-j$(nproc) 在 16GB runner 上会把内存吃穿，
+        # OOM 杀掉 runner agent 的表现就是 "lost communication with the server"
         CPUS=$(nproc --all)
         MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
         JOBS="${{ inputs.BUILD_JOBS }}"
@@ -599,42 +635,36 @@ jobs:
         free -h || true
         df -h . || true
         if [ "$AVAIL_GB" -lt 15 ]; then
-          echo "::warning::磁盘仅剩 ${AVAIL_GB}GB，out/ 很可能写满导致 runner 失联"
+          echo "::warning::磁盘仅剩 ${AVAIL_GB}GB，out/ 可能写满导致 runner 失联"
         fi
         echo "并行度：make -j${JOBS}"
 
-        # soong_build 是 Go 程序，堆会涨到存活对象的数倍；给一个软上限，
-        # 让它多做 GC 而不是一路涨到被内核 OOM（在低内存 runner 上很常见）。
+        # soong_build 是 Go 程序，给个软上限让它多做 GC，而不是被内核 OOM
         if [ -z "${GOMEMLIMIT:-}" ]; then
           export GOMEMLIMIT=$(( MEM_GB * 70 / 100 ))GiB
         fi
-        # GOGC 调低 → 更早、更频繁地 GC，堆峰值更低（用时间换内存）
         export GOGC="${GOGC:-80}"
         echo "GOMEMLIMIT=$GOMEMLIMIT GOGC=$GOGC"
-        echo "（这两个变量靠 scripts/patch_soong_memlimit.py 透传给 soong_build，"
-        echo "  否则 env -i 会把它们清掉）"
+        echo "（这两个变量靠 scripts/patch_soong_memlimit.py 透传给 soong_build）"
 
-        # 心跳：每 60s 打一行内存/磁盘。进程被外部杀掉时日志会突然截断，
-        # 有这条时间线就能看出是内存一路涨到顶，还是一直很平稳（外部原因）。
+        # 心跳：进程被外部杀掉时日志会突然截断，有这条时间线才能区分 OOM 和外部原因
         (
           while :; do
             sleep 60 || exit 0
             printf '[heartbeat %s] ' "$(date -u +%H:%M:%S)"
             awk '/MemAvailable/{printf "可用内存 %.1fGB ", $2/1024/1024}' /proc/meminfo
-            printf '剩余磁盘 %s\n' "$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9')GB"
+            printf '剩余磁盘 %sGB\n' "$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9')"
           done
         ) &
         HB=$!
         stop_hb() { kill "$HB" 2>/dev/null || true; pkill -P "$HB" 2>/dev/null || true; }
 
-        # 被 SIGTERM 杀掉时（exit 143）先记录现场，否则日志会断在半截、
-        # 看不出是 OOM、超时还是 runner 被回收。
         on_term() {
           stop_hb
-          echo "::error::编译进程收到 SIGTERM（exit 143）——常见原因：任务被取消、超时、runner 被回收"
+          echo "::error::编译进程收到 SIGTERM（exit 143）——任务被取消、超时或 runner 被回收"
           echo "===== 内存 ====="; free -h || true
           echo "===== 磁盘 ====="; df -h . || true
-          echo "===== 占用内存最多的进程 ====="
+          echo "===== 内存占用 top10 ====="
           ps -eo pid,rss,pcpu,comm --sort=-rss 2>/dev/null | head -10 || true
           echo "===== 内核 OOM 记录 ====="
           sudo dmesg 2>/dev/null | grep -iE "out of memory|killed process|oom" | tail -10 || true
@@ -646,8 +676,7 @@ jobs:
         make -j"$JOBS" "$MAKE_TARGET" 2>&1 | tee build.log || RC=${PIPESTATUS[0]}
         trap - TERM INT
         stop_hb
-        # 失败时把真正的 FAILED 块摘出来：日志动辄七八千行，
-        # 只看结尾只会得到 "ninja: build stopped" 这一句结论。
+
         show_failed() {
           awk -v max="${2:-3}" '
             /^FAILED: /{n++; if (n > max) exit; show = 1; c = 0}
@@ -665,7 +694,6 @@ jobs:
           echo "===== error 行 ====="
           grep -nE "(^| )error: " build.log | head -10 || true
           echo "::endgroup::"
-          # 同时写到运行页面的 Summary，省得去翻几千行日志
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             {
               echo "## 构建失败（make 退出码 $RC）"
@@ -677,11 +705,11 @@ jobs:
           fi
         fi
         echo "make 退出码：$RC"
+        ccache -s 2>/dev/null | head -12 || true
         exit "$RC"
 
     # ──────────────────────────────────────────────────────────────
-    # 6.5 失败现场取证：exit 143 这类“进程被外部信号杀掉”的情况，
-    #     编译日志往往断在半截，真正原因在内核日志里
+    # 7. 失败取证
     # ──────────────────────────────────────────────────────────────
     - name: Diagnose unexpected termination
       if: failure() || cancelled()
@@ -719,8 +747,7 @@ jobs:
         if [ -f build.log ]; then
           grep -nE "^FAILED: |missing and no known rule|ninja failed with" build.log | tail -20 || true
           if grep -q "missing and no known rule" build.log; then
-            echo "::notice::缺少构建规则：通常是引用了源码里不存在的模块名"
-            echo "（例如已被 AOSP 删除的 -ndk_platform 后缀，或清单没同步对应仓库）"
+            echo "::notice::缺少构建规则：通常引用了源码里不存在的模块名"
             grep -oE "[A-Za-z0-9_.@+-]+-ndk_platform" build.log | sort -u | head -10 || true
           fi
         fi
@@ -736,6 +763,9 @@ jobs:
         if-no-files-found: ignore
         retention-days: 5
 
+    # ──────────────────────────────────────────────────────────────
+    # 8. 产物
+    # ──────────────────────────────────────────────────────────────
     - name: Collect outputs
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
@@ -758,11 +788,6 @@ jobs:
           workspace/out/target/product/${{ steps.build.outputs.product }}/*.zip
         if-no-files-found: warn
 
-    # ──────────────────────────────────────────────────────────────
-    # 7. 发布
-    #    原脚本 bug：产物名写死 vendorboot.img（实际是 vendor_boot.img），
-    #                且目录用 DEVICE_NAME —— lunch 出来是 PD2551 时直接找不到文件
-    # ──────────────────────────────────────────────────────────────
     - name: Upload to Release
       if: success()
       uses: softprops/action-gh-release@v2
@@ -774,6 +799,7 @@ jobs:
         tag_name: ${{ github.run_id }}
         fail_on_unmatched_files: false
         body: |
+          Runner: ubuntu-22.04
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
           Device: ${{ inputs.DEVICE_NAME }}
           Target: ${{ inputs.BUILD_TARGET }}.img
