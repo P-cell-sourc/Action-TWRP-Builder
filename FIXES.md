@@ -432,6 +432,26 @@ BOARD_USES_VENDOR_BOOT := true        # ← AOSP 没有这个变量
 
 **为什么 AVB 那四项一定不能漏**：有些机型不允许刷 `vbmeta` 去关校验（`fastboot --disable-verification flash vbmeta` 会失败或直接不启动）。这种情况下镜像自身必须带 hash footer，否则 bootloader 连"结构合法"这一步都过不了。
 
+### 19. 产物里多出一个 `ramdisk.img`，是不是没合进 vendor_boot
+
+**现象**：`vendor_boot.img` 旁边还躺着个 2.8 MB 的 `ramdisk.img`，一起被打进了 artifact / Release。
+
+**结论：不用合，它本来就已经在 `vendor_boot.img` 里了。**
+
+`ramdisk.img` 是 `INSTALLED_RAMDISK_TARGET`，也就是通用 ramdisk 的**打包中间件**，位于 `PRODUCT_OUT` 顶层（和 `boot.img` 同级），所以被 `cp "$OUT"/*.img` 一起捡走了。它有两个特征说明它不是给人刷的：
+
+1. 它是 LZ4 legacy 帧压缩的 cpio，不是 boot image 格式 —— `fastboot flash` 没有对应的分区可以接收它；
+2. 它的内容已经作为 vendor_boot 的 **platform 片段**（v4 分片表 `ramdisk_type=0`）编进去了，加上 recovery 片段后才是完整的 `/init` + TWRP。
+
+拆开验证过（第 18 条那次产物，128 MB / header v4）：
+
+| 片段 | 类型 | 压缩后 | 解压后 | 内容 |
+|---|---|---|---|---|
+| 0（空名） | platform | 20.0 MB | 68.2 MB | `first_stage_ramdisk/*`（linker64、libc、libc++、fstab）+ `lib/modules/6.6-gki` 61 MB |
+| 1 `recovery` | recovery | 66.6 MB | 182.0 MB | `init` → `system/bin/init`、`system/bin/recovery` 2.69 MB、`system/bin/twrp`、`init.recovery.mt6899.rc`、`twres/`、`system/etc/recovery.fstab` |
+
+**改法**（workflow `Collect outputs`）：从「复制 `$OUT` 下全部 `.img`」改为白名单，只收真正能刷的分区镜像 —— `boot / vendor_boot / recovery / dtbo / lk / vbmeta* / super_empty` 和 `.zip`；`ramdisk*.img`、`userdata.img`、`system.img` 等一律跳过，并在日志里打一行 `::notice::` 列出被跳过的中间件。同时把构建后自检的 `count_imgs` 也改成只数可交付镜像，避免"只有 ramdisk.img 也算编成功"。
+
 ## 四、怎么用
 
 二选一：
