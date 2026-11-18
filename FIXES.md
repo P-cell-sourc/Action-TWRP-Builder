@@ -452,6 +452,43 @@ BOARD_USES_VENDOR_BOOT := true        # ← AOSP 没有这个变量
 
 **改法**（workflow `Collect outputs`）：从「复制 `$OUT` 下全部 `.img`」改为白名单，只收真正能刷的分区镜像 —— `boot / vendor_boot / recovery / dtbo / lk / vbmeta* / super_empty` 和 `.zip`；`ramdisk*.img`、`userdata.img`、`system.img` 等一律跳过，并在日志里打一行 `::notice::` 列出被跳过的中间件。同时把构建后自检的 `count_imgs` 也改成只数可交付镜像，避免"只有 ramdisk.img 也算编成功"。
 
+### 20. 刷完黑屏：TWRP 起来了，但 9 毫秒后 exit 1
+
+**现场（PD2551 的 `console-ramoops-0`，1741 行，UTF-16LE）**：
+
+```
+[    4.942837][    T1] init: First stage mount skipped (recovery mode)
+[    5.040408][    T1] init: Added '/init.recovery.mt6899.rc' to import list
+[    5.236904][    T1] init: starting service 'recovery'...
+[    5.240836][  T230] KernelSU: hook_manager: unmark 230 exec /system/bin/recovery
+[    5.249641][    T1] init: Service 'recovery' (pid 230) exited with status 1
+```
+
+结论：**不是 AVB、不是镜像结构、也不是 ramdisk 没进去** —— recovery 模式确实进了，TWRP 二进制确实被 exec 了，但约 9 ms 就 `exit 1`，init 每 5 秒重启一次 → 黑屏死循环。
+
+**根因：recovery 里一个内核模块都没加载。**
+
+```
+[    4.942181][    T1] init: module bootprof can't be loaded;
+                          can't access /lib/modules/bootprof.ko: No such file or directory
+```
+
+拆开 `vendor_boot.img` 确认，模块实际在 `lib/modules/6.6-gki/`（266 个，含 `mediatek-drm.ko`、`mtk_disp_notify.ko`、`panel_common.ko`、`vivo_display.ko`），而 AOSP first stage init 只找 `/lib/modules/<name>.ko` 这种**平铺路径**，于是整份清单只尝试了第一个就断了。连带后果：
+
+| 缺的模块 | 后果 |
+|---|---|
+| `mediatek-drm.ko` 等显示链 | 没有 fb / DRM 节点 → TWRP minui 初始化失败 → `exit(1)` |
+| `extcon-mtk-usb.ko` 等 | 没有 UDC（`UDC core: g1: couldn't find an available UDC`）→ recovery 里 adb 起不来，`/tmp/recovery.log` 拿不到 |
+
+旁证：pstore 的 `pmsg` 里 `adbd: timed out while waiting for FUNCTIONFS_BIND`，以及所有依赖 TEE 的服务（mobicore / gatekeeper / keymint）也一并 exit 1 —— 这些是 recovery 下密钥服务本来就起不来的正常现象，不要误判。
+
+**改法**：新增 `scripts/fix_recovery_init.py`，接在 `Building recovery` 之前的 5.13 步，做两件事：
+
+1. 往设备树 `recovery/root/system/bin/` 写一个 `twrp-modules.sh`，并在 `bootable/recovery/etc/init.rc` 追加 `on fs` 的 `exec ... /system/bin/sh /system/bin/twrp-modules.sh`：auto 找 `/lib/modules/*/modules.load.recovery`（没有就 `modules.load`），逐个 `insmod`，最后把 `insmod ok=N fail=M`、`/dev/graphics/fb0`、`/dev/dri/card0`、`/sys/class/udc` 的内容 echo 出去。init 的 `exec` 继承 stdout(`/dev/kmsg`)，所以下次从 pstore 就能看到这些统计。
+2. 给 `etc/init.recovery.service22.rc` 的 `service recovery` 加 `stdio_to_kmsg`：TWRP 的 stdout/stderr 不再丢进 `/dev/null`，它 exit(1) 的真正原因会直接进 `console-ramoops`。
+
+**为什么选 `on fs` 而不是 `late-init`**：TWRP 的服务挂在 `boot` 触发器上，而 `boot` 是在 `late-init` 段里 `trigger` 出来的，追加到 `late-init` 尾部容易和它抢顺序；`fs` 阶段（约 5.2 s）早于 `boot`（5.23 s），且 ueventd 已在 `early-init` 起来，模块注册时的 uevent 能立刻生成 `/dev/graphics/fb0`。
+
 ## 四、怎么用
 
 二选一：

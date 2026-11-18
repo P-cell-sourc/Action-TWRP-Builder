@@ -596,6 +596,26 @@ jobs:
           || echo "::warning::recovery 链接依赖未补齐，recovery 可能链接失败"
 
     # ──────────────────────────────────────────────────────────────
+    # 5.13 recovery 的内核模块与诊断输出
+    #      实测 pstore 里看到：
+    #        init: module bootprof can't be loaded; can't access
+    #              /lib/modules/bootprof.ko: No such file or directory
+    #      MTK 设备树把 .ko 放在 /lib/modules/6.6-gki/ 下，first stage init
+    #      只认 /lib/modules/<name>.ko 的平铺路径 → recovery 里一个模块都
+    #      没加载：没有 mediatek-drm.ko 就没有显示，没有 extcon-mtk-usb.ko
+    #      就没有 UDC（adb 也起不来），TWRP 初始化图形失败后 exit(1) 黑屏。
+    #      这里补一个 insmod 兜底，并给 recovery 服务加 stdio_to_kmsg，
+    #      让 TWRP 的 stdout/stderr 进 kmsg（下次可从 pstore 直接看原因）。
+    # ──────────────────────────────────────────────────────────────
+    - name: Patch recovery init (load vendor modules + kmsg stdio)
+      continue-on-error: true
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        python3 "$GITHUB_WORKSPACE/scripts/fix_recovery_init.py" . "${{ inputs.DEVICE_PATH }}" \
+          || echo "::warning::recovery init 补丁未完成（模块加载 / stdio_to_kmsg）"
+
+    # ──────────────────────────────────────────────────────────────
     # 6. 编译
     # ──────────────────────────────────────────────────────────────
     - name: Building recovery
