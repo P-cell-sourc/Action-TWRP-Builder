@@ -540,6 +540,70 @@ dep 里 f2fs*: []   ext4*: []   erofs*: []
 | `modules.load.recovery` 不能动 | 那是 second stage 给 TWRP 用的，`twrp-modules.sh` 按 `6.6-gki` 子目录加载 |
 | `modules.alias` / `modules.softdep` 的格式警告消不掉 | MTK 用 modprobe 风格生成（5~6 个字段），AOSP init 的解析器只认 3/4 个字段，会跳过这些行；recovery 不走 `modprobe`，无影响 |
 
+### 22. 精简了半天 `modules.load`，recovery 模式压根不读它
+
+**现场**（`console-ramoops`，4.87 s）：
+
+```
+init: Loading module /lib/modules/bootprof.ko with args ''
+init: Loaded kernel module /lib/modules/bootprof.ko
+init: Loading module /lib/modules/mrdump.ko with args ''
+init: Loaded kernel module /lib/modules/mrdump.ko
+init: Loading module /lib/modules/aee_aed.ko with args ''
+init: Loaded kernel module /lib/modules/aee_aed.ko
+init: module vivo_bsp_engine can't be loaded; can't access /lib/modules/vivo_bsp_engine.ko: No such file or directory
+init: Loaded 3 modules from /lib/modules/6.6-gki
+init: Failed to load kernel modules
+Kernel panic - not syncing: Attempted to kill init! exitcode=0x00007f00
+```
+
+前 3 条全 `Loaded`，第 4 条 `vivo_bsp_engine` 找不到，然后 init 退出、内核 panic（`0x7f00` = exit 127）。first stage 的模块加载是**全有或全无**，没有「跳过失败项继续」的开关。
+
+**排查弯路**：一开始怀疑是 `modules.dep` 里 `aee_aed.ko` 标了 `vivo_bsp_engine` 依赖 —— 查设备树，`aee_aed.ko:` 后面是空的，不成立。又怀疑脚本把一条不存在的 `.ko` 写进了清单 —— 构建日志里 `Copy: .../6.6-gki/vivo_bsp_engine.ko` 说明这个文件**存在**。两条都不对。
+
+**真因**：`system/core/init/first_stage_init.cpp` 的 `GetModuleLoadList()`：
+
+```cpp
+switch (boot_mode) {
+    case BootMode::NORMAL_MODE:   module_load_file = "modules.load"; break;
+    case BootMode::RECOVERY_MODE: module_load_file = "modules.load.recovery"; break;
+    case BootMode::CHARGER_MODE:  module_load_file = "modules.load.charger"; break;
+}
+if (module_load_file != "modules.load") {
+    // Fall back to modules.load if the other files aren't accessible
+    if (stat((dir_path + "/" + module_load_file).c_str(), &fileStat))
+        module_load_file = "modules.load";
+}
+```
+
+本机 cmdline 里 `recoverymode=1`，所以走的是 **`modules.load.recovery`（286 条原始清单）**，`modules.load`（被精简成 3 条）只有在 recovery 清单不存在时才会被 fall back 到。构建日志白纸黑字写着 `✓ 重写 modules.load（266 -> 3 条）`，但那份文件根本没被读。
+
+对照一下，两边前四行完全一致，正好是设备上的 3 成功 + 1 失败：
+
+```
+modules.load            modules.load.recovery
+bootprof.ko             bootprof.ko
+mrdump.ko               mrdump.ko
+aee_aed.ko              aee_aed.ko
+vivo_bsp_engine.ko      vivo_bsp_engine.ko   ← 失败在这里
+```
+
+**改法**（`scripts/fix_first_stage_modules.py` 新增 1b 段）：
+
+1. 把原 `modules.load.recovery`（286 条）另存为 `modules.load.twrp`；
+2. `modules.load.recovery` 改写成与 `modules.load` 相同的精简清单（3 条，全是已平铺的 `.ko`）；
+3. 设备树 `recovery/root/system/bin/twrp-modules.sh` 的清单查找顺序改成
+   `modules.load.twrp` → `modules.load.recovery` → `modules.load`。
+
+这样 first stage 只加载 3 个平铺的模块（必然成功），进入 second stage 后由
+`twrp-modules.sh` 按 `modules.load.twrp` 全量加载 286 个（drm / panel / usb 都在里面）。
+
+| 坑 | 说明 |
+|---|---|
+| 同名文件承担两种用途 | `modules.load.recovery` 既是 first stage 的加载清单，又被 TWRP 当成全量清单，必须先拆成两份 |
+| 日志里 `Loaded N modules from /lib/modules/6.6-gki` 具有误导性 | 它只表示「这个目录加载成功了 N 个」，不代表清单只有 N 条 |
+| `.ko` 在子目录、清单在子目录、加载路径却是平铺 | 三者不在同一层，改哪个都要先弄清 init 拼的是哪条路径 |
+
 ## 四、怎么用
 
 二选一：

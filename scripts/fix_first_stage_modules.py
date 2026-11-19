@@ -30,11 +30,15 @@ MTK 设备树把 vendor 模块放在 /lib/modules/<kver>/ 下（如 6.6-gki）�
 4. 把保留的 .ko **平铺复制**到 `lib/modules/` 根下，供 init 按
    /lib/modules/<name>.ko 找到。
 
+注意：first stage 只要有一条加载失败就整体失败、init exit(1)、内核 panic。
+所以写清单前会按文件存在性再过滤一遍。
+
 为什么不直接「全平铺」：303 个 .ko 共 61 MB，vendor_boot 分区 128 MB，
 现有产物已 87 MB，全平铺会直接超限（add_hash_footer: image too large）。
 
-`modules.load.recovery` 不动 —— 那是 second stage 给 TWRP 用的，
-由 system/bin/twrp-modules.sh 按 6.6-gki 子目录加载。
+`modules.load.recovery` 必须一起处理 —— recovery 模式（cmdline 带 recoverymode=1）
+下 init 读的是它，不是 `modules.load`。原 286 条清单另存为 `modules.load.twrp`，
+交给 second stage 的 system/bin/twrp-modules.sh 按 6.6-gki 子目录全量加载。
 
 用法
 ----
@@ -132,7 +136,7 @@ def render(kept, fs_builtin, src_dir):
         "#   完整清单（266~286 条）已精简，保留项与它们的依赖闭包如下。",
         "#",
         "#   drm / panel / touch / usb 由 second stage 的 system/bin/twrp-modules.sh",
-        "#   按同目录 modules.load.recovery 加载，不在本清单内。",
+        "#   按同目录 modules.load.twrp（全量原清单）加载，不在本清单内。",
         "#",
         "# 原始目录：%s" % os.path.basename(src_dir),
     ]
@@ -167,6 +171,15 @@ def main():
     deps = parse_dep(os.path.join(src_dir, "modules.dep"))
     kept, fs_builtin = build_list(order, deps)
 
+    # 防御性过滤：清单里若混进目录中根本不存在的 .ko，init 会整体失败并 panic
+    # （LoadModulesFromFile 是全有或全无，一条失败就 exit(1) → Attempted to kill init）。
+    # 这次真正踩到的是 modules.load.recovery 那条路径（见 1b），这层检查留着，
+    # 免得换机型再中一次。
+    absent = [m for m in kept if not os.path.isfile(os.path.join(src_dir, m))]
+    if absent:
+        kept = [m for m in kept if m not in absent]
+        print("  ! 目录中不存在，从清单剔除: %s" % " ".join(absent))
+
     print("  模块目录 : %s" % os.path.relpath(src_dir, root))
     print("  原清单   : %d 条，dep 图 %d 条" % (len(order), len(deps)))
     print("  保留     : %d 条 %s" % (len(kept), " ".join(kept[:8]) if kept else "(空)"))
@@ -184,6 +197,31 @@ def main():
         with open(load, "w", encoding="utf-8") as f:
             f.write(want)
         print("  ✓ 重写 modules.load（%d -> %d 条）" % (len(order), len(kept)))
+
+    # ── 1b. recovery 模式读的不是 modules.load，而是 modules.load.recovery
+    #   system/core/init/first_stage_init.cpp:
+    #       case BootMode::RECOVERY_MODE: module_load_file = "modules.load.recovery";
+    #       ... 只有该文件不存在，才 fall back 到 modules.load
+    #   本机 cmdline 带 recoverymode=1，所以只精简 modules.load 等于没做 ——
+    #   init 仍然按 286 条那份加载，第 4 条 vivo_bsp_engine 找不到就 exit(1)。
+    #   全量清单另存为 modules.load.twrp（给 second stage 的 twrp-modules.sh），
+    #   modules.load.recovery 自己写精简版，内容全是已平铺的 .ko。
+    rload = os.path.join(src_dir, "modules.load.recovery")
+    full = os.path.join(src_dir, "modules.load.twrp")
+    if os.path.isfile(rload):
+        if not os.path.isfile(full):
+            rn = len([l for l in read_lines(rload)
+                      if l.strip() and not l.strip().startswith("#")])
+            shutil.copy2(rload, full)
+            print("  ✓ 全量清单另存为 modules.load.twrp（%d 条，供 second stage）" % rn)
+        with open(rload, "r", encoding="utf-8", errors="replace") as f:
+            rcur = f.read()
+        if rcur != want:
+            with open(rload, "w", encoding="utf-8") as f:
+                f.write(want)
+            print("  ✓ 重写 modules.load.recovery（recovery 模式也只用这 %d 条）" % len(kept))
+    else:
+        print("  ! 没有 modules.load.recovery：recovery 模式会回退 modules.load")
 
     # ── 2. 平铺复制到 lib/modules/ 根下
     copied, missing, size = 0, [], 0
