@@ -604,6 +604,48 @@ vivo_bsp_engine.ko      vivo_bsp_engine.ko   ← 失败在这里
 | 日志里 `Loaded N modules from /lib/modules/6.6-gki` 具有误导性 | 它只表示「这个目录加载成功了 N 个」，不代表清单只有 N 条 |
 | `.ko` 在子目录、清单在子目录、加载路径却是平铺 | 三者不在同一层，改哪个都要先弄清 init 拼的是哪条路径 |
 
+### 23. init 拒绝执行 twrp-modules.sh：`/system/bin/sh` 没有 SELinux 标签
+
+**现场**（`console-ramoops`，5.139 s，紧跟在 `processing action (fs)` 之后）：
+
+```
+init: Command 'exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh'
+      action=fs (/system/etc/init/hw/init.rc:223) took 0ms and failed:
+      Could not start exec service: File /system/bin/sh(labeled "u:object_r:rootfs:s0")
+      has incorrect label or no domain transition from u:r:init:s0 to another SELinux
+      domain defined. Have you configured your service correctly?
+      Note: this error shows up even in permissive mode in order to make auditing
+      denials possible.
+```
+
+同一份日志里还有两个对照点，正好用来定位：
+
+- 同目录的 `prepdecrypt.sh`（pid 193）**起得来** —— 它走的是 `service` + `seclabel`，不靠文件标签；
+- `exec u:r:ksu:s0 root -- /data/adb/ksud ...` 的失败原因是 `Cannot find '/data/adb/ksud'`，**不是标签错误** —— 说明 `exec <seclabel> <user> <group> --` 这套语法本身可用。
+
+**根因**：recovery 的 ramdisk 是 rootfs，`/system/bin/sh` 没有 file_contexts 规则，标签落成 `u:object_r:rootfs:s0`。`exec` 不带 seclabel 时，init 靠文件标签推断 domain，推不出来就拒绝启动。这条检查在 **permissive 下照样执行**（init 自己的硬校验，不是 SELinux 强制），所以 `setenforce 0` 也没用。
+
+**改法**：`exec` 显式带上 seclabel，用 recovery 服务自己的域：
+
+```diff
+ on fs
+-    exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh
++    exec u:r:recovery:s0 root root -- /system/bin/sh /system/bin/twrp-modules.sh
+```
+
+`u:r:recovery:s0` 是 `init.recovery.service.rc` 里 `service recovery` 用的同一个域，必然存在、必然允许 init 切换。仍然是**同步**执行，TWRP 启动前模块一定加载完（换成 `service` + `start` 是异步的，prepdecrypt 只比 recovery 早 13 ms，来不及）。
+
+`fix_recovery_init.py` 里同时处理了已存在的旧写法（`OLD_EXEC` → `NEW_EXEC`），重跑不会重复追加。
+
+**顺带确认的两件事**（这次日志里都有）：
+
+| 项 | 证据 |
+|---|---|
+| `modules.load.twrp` 确实进了 ramdisk | 构建日志 `Copy: out/target/product/PD2551/vendor_ramdisk/lib/modules/6.6-gki/modules.load.twrp` |
+| first stage 那 3 条是必然成功的 | `init: Loaded 3 modules from /lib/modules/6.6-gki`，无 `Failed to load kernel modules`、无 panic |
+
+**为什么没有 `[twrp-fix]` 输出**：脚本压根没被执行，不是执行了没输出。先看 `on fs` 那条 `exec` 有没有报错，再看脚本自己的 log —— 这两步不能跳。
+
 ## 四、怎么用
 
 二选一：

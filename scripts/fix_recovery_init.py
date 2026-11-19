@@ -36,10 +36,21 @@ INIT_RC_BLOCK = """
 # @@MARK@@ 内核模块兜底加载
 #   MTK 把模块放在 /lib/modules/<kver>/，first stage init 找不到，
 #   这里在 TWRP 启动之前自己 insmod 一遍（fs 阶段早于 boot 触发）。
+#   必须显式给 seclabel：ramdisk 里 /system/bin/sh 的标签是
+#   u:object_r:rootfs:s0，init 无从推断 domain，会直接拒绝启动：
+#     Command 'exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh'
+#     failed: Could not start exec service: File /system/bin/sh(labeled
+#     "u:object_r:rootfs:s0") has incorrect label or no domain transition
+#     from u:r:init:s0 ... Note: this error shows up even in permissive mode
+#   recovery 域是 recovery 服务自己用的，一定存在。
 #   用 sh 显式调用，避免 recovery/root 里的文件丢了可执行位。
 on fs
-    exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh
+    exec u:r:recovery:s0 root root -- /system/bin/sh /system/bin/twrp-modules.sh
 """.replace("@@MARK@@", MARK)
+
+# 旧版写法（没有 seclabel），已刷入过的设备/已打补丁的 init.rc 里会有这行
+OLD_EXEC = "    exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh"
+NEW_EXEC = "    exec u:r:recovery:s0 root root -- /system/bin/sh /system/bin/twrp-modules.sh"
 
 LOADER = r"""#!/system/bin/sh
 # @@MARK@@ 由 twrp-builder 生成：加载 /lib/modules/<kver>/ 下的 vendor 内核模块
@@ -169,6 +180,11 @@ def patch_init_rc(source_root):
         print("  ! 找不到 %s" % p)
         return False
     s = read(p)
+    if OLD_EXEC in s:
+        s = s.replace(OLD_EXEC, NEW_EXEC)
+        write(p, s)
+        print("  ✓ 已给 on fs 的 exec 补上 seclabel（u:r:recovery:s0）")
+        return True
     if MARK in s and "twrp-modules.sh" in s:
         print("  %s 已含模块加载段" % p)
         return True
