@@ -11,7 +11,7 @@ MTK 设备树把 .ko 放在 /lib/modules/<kver>/ 下，而 AOSP first stage init
 这份脚本做两件事，都只改 CI 克隆下来的源码，不动设备树仓库：
 
 1. 往设备树 recovery/root/system/bin/ 里放一个 twrp-modules.sh，并在
-   bootable/recovery/etc/init.rc 追加一条 `on late-init` 的 exec —— 在 TWRP
+   bootable/recovery/etc/init.rc 追加一条 `on fs` 的 exec —— 在 TWRP
    启动前把 /lib/modules/<kver>/modules.load(.recovery) 里的模块逐个 insmod。
    脚本自己会把统计结果 echo 出来，init 的 exec 继承 stdout(/dev/kmsg)，
    所以下次从 pstore 就能看到 "insmod ok: N" 和 fb0/udc 是否存在。
@@ -33,55 +33,104 @@ import sys
 MARK = "[twrp-builder-fix]"
 
 INIT_RC_BLOCK = """
-# %s 内核模块兜底加载
+# @@MARK@@ 内核模块兜底加载
 #   MTK 把模块放在 /lib/modules/<kver>/，first stage init 找不到，
 #   这里在 TWRP 启动之前自己 insmod 一遍（fs 阶段早于 boot 触发）。
 #   用 sh 显式调用，避免 recovery/root 里的文件丢了可执行位。
 on fs
     exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh
-""" % MARK
+""".replace("@@MARK@@", MARK)
 
 LOADER = r"""#!/system/bin/sh
-# %s 由 twrp-builder 生成：加载 /lib/modules/<kver>/ 下的 vendor 内核模块
+# @@MARK@@ 由 twrp-builder 生成：加载 /lib/modules/<kver>/ 下的 vendor 内核模块
 # 不加载它们的话：没有 mediatek-drm.ko → 无显示；没有 extcon-mtk-usb.ko → 无 adb。
+#
+# 为什么需要这个脚本：
+#   MTK 把 .ko 放在 /lib/modules/6.6-gki/ 下，而 AOSP first stage init 只认
+#   /lib/modules/<name>.ko 这种平铺路径，报 "module bootprof can't be loaded"，
+#   结果是 recovery 里一个模块都没加载，TWRP 初始化图形失败后 exit(1)。
+#   MTK 自己给 recovery 备了一份 286 条的 modules.load.recovery，这里按它加载。
+
+# init 的 exec 子进程 stdout 通常已是 /dev/kmsg，再显式指一次，防止被丢进 /dev/null
+[ -e /dev/kmsg ] && exec 1>/dev/kmsg 2>&1
+
+log() { echo "[twrp-fix] $*"; }
+
+# ── 1. 找模块目录与清单：优先 modules.load.recovery，其次 modules.load
 D=""
 L=""
 for d in /lib/modules/*/ ; do
-    [ -d "$d" ] || continue
     if [ -f "$d/modules.load.recovery" ]; then
-        L="$d/modules.load.recovery"; D="$d"; break
-    elif [ -f "$d/modules.load" ]; then
-        L="$d/modules.load"; D="$d"; break
+        D="$d"; L="${d}modules.load.recovery"; break
     fi
 done
-
 if [ -z "$L" ]; then
-    L=/lib/modules/modules.load.recovery
-    [ -f "$L" ] || L=/lib/modules/modules.load
-    D=/lib/modules/
+    for d in /lib/modules/*/ ; do
+        if [ -f "$d/modules.load" ]; then
+            D="$d"; L="${d}modules.load"; break
+        fi
+    done
+fi
+# 兜底：清单直接平铺在 /lib/modules/ 下
+if [ -z "$L" ]; then
+    if [ -f /lib/modules/modules.load.recovery ]; then
+        L=/lib/modules/modules.load.recovery; D=/lib/modules/
+    elif [ -f /lib/modules/modules.load ]; then
+        L=/lib/modules/modules.load; D=/lib/modules/
+    fi
 fi
 
-if [ ! -f "$L" ]; then
-    echo "[twrp-fix] no modules.load found under /lib/modules"
+if [ -z "$L" ]; then
+    log "no modules.load under /lib/modules — 跳过"
     exit 0
 fi
 
-ok=0; fail=0
-while read -r m; do
-    case "$m" in ''|\#*) continue ;; esac
-    if insmod "$D$m" >/dev/null 2>&1; then
+# ── 2. 逐个 insmod
+t0=$(date +%s)
+total=0; ok=0; skip=0; fail=0; failed=""
+while IFS= read -r m || [ -n "$m" ]; do
+    m=$(echo "$m" | tr -d '\r')
+    case "$m" in ''|'#'*) continue ;; esac
+    total=$((total+1))
+    err=$(insmod "$D$m" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
         ok=$((ok+1))
     else
-        fail=$((fail+1))
+        case "$err" in
+            # 已内建或已被依赖链加载过，不算失败
+            *"File exists"*|*"already"*) skip=$((skip+1)) ;;
+            *)
+                fail=$((fail+1))
+                [ $fail -le 8 ] && failed="$failed $m"
+                ;;
+        esac
     fi
 done < "$L"
 
-echo "[twrp-fix] modules from $L: insmod ok=$ok fail=$fail"
-[ -e /dev/graphics/fb0 ] && echo "[twrp-fix] /dev/graphics/fb0 present"
-[ -e /dev/dri/card0 ] && echo "[twrp-fix] /dev/dri/card0 present"
-[ -d /sys/class/udc ] && echo "[twrp-fix] udc: $(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')"
+t1=$(date +%s)
+log "modules from $L: total=$total ok=$ok skip=$skip fail=$fail ($((t1-t0))s)"
+[ -n "$failed" ] && log "insmod failed:$failed"
+
+# ── 3. 关键节点自检：这几个是"能不能显示 / 能不能 adb"的判据
+sleep 1
+if [ -e /dev/graphics/fb0 ]; then
+    log "/dev/graphics/fb0 present"
+else
+    log "/dev/graphics/fb0 MISSING"
+fi
+if [ -e /dev/dri/card0 ]; then
+    log "/dev/dri/card0 present"
+else
+    log "/dev/dri/card0 MISSING"
+fi
+u=$(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')
+if [ -n "$u" ]; then
+    log "udc: $u"
+else
+    log "udc: NONE"
+fi
 exit 0
-""" % MARK
+""".replace("@@MARK@@", MARK)
 
 STDIO_OPT = "    stdio_to_kmsg"
 
@@ -114,7 +163,7 @@ def patch_loader(source_root, device_path):
 
 
 def patch_init_rc(source_root):
-    """bootable/recovery/etc/init.rc 追加 on late-init 的 exec"""
+    """bootable/recovery/etc/init.rc 追加 on fs 的 exec"""
     p = os.path.join(source_root, "bootable", "recovery", "etc", "init.rc")
     if not os.path.isfile(p):
         print("  ! 找不到 %s" % p)
@@ -127,7 +176,7 @@ def patch_init_rc(source_root):
         s += "\n"
     s += INIT_RC_BLOCK
     write(p, s)
-    print("  ✓ 追加 on late-init → twrp-modules.sh (%s)" % p)
+    print("  ✓ 追加 on fs → twrp-modules.sh (%s)" % p)
     return True
 
 

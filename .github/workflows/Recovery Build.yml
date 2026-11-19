@@ -394,6 +394,14 @@ jobs:
         python3 "$GITHUB_WORKSPACE/scripts/fix_device_vendor_boot.py" . "${{ inputs.DEVICE_PATH }}" \
           || echo "::warning::vendor_boot 配置修补未完成，继续尝试编译"
 
+        # (5.5) first stage 模块清单：只留真正需要的，并平铺到 /lib/modules/
+        #       MTK 把 .ko 放在 lib/modules/<kver>/，init 却按平铺路径拼
+        #       /lib/modules/<name>.ko，清单第一行（bootprof.ko）找不到就整体
+        #       中断，266 条一条都不加载。这里按 modules.dep 的依赖图保留
+        #       文件系统模块 + MTK 崩溃转储/性能跟踪，并把它们复制到根下。
+        python3 "$GITHUB_WORKSPACE/scripts/fix_first_stage_modules.py" . "${{ inputs.DEVICE_PATH }}" \
+          || echo "::warning::first stage 模块清单精简未完成，继续尝试编译"
+
         # (6) 预检：设备树继承的 $(SRC_TARGET_DIR)/product/*.mk 是否真的存在
         MISSING=""
         REFS=0

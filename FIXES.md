@@ -487,7 +487,58 @@ BOARD_USES_VENDOR_BOOT := true        # ← AOSP 没有这个变量
 1. 往设备树 `recovery/root/system/bin/` 写一个 `twrp-modules.sh`，并在 `bootable/recovery/etc/init.rc` 追加 `on fs` 的 `exec ... /system/bin/sh /system/bin/twrp-modules.sh`：auto 找 `/lib/modules/*/modules.load.recovery`（没有就 `modules.load`），逐个 `insmod`，最后把 `insmod ok=N fail=M`、`/dev/graphics/fb0`、`/dev/dri/card0`、`/sys/class/udc` 的内容 echo 出去。init 的 `exec` 继承 stdout(`/dev/kmsg`)，所以下次从 pstore 就能看到这些统计。
 2. 给 `etc/init.recovery.service22.rc` 的 `service recovery` 加 `stdio_to_kmsg`：TWRP 的 stdout/stderr 不再丢进 `/dev/null`，它 exit(1) 的真正原因会直接进 `console-ramoops`。
 
+脚本的几处细节（都是踩过坑才这么写的）：
+
+| 细节 | 原因 |
+|---|---|
+| 优先 `modules.load.recovery` | 实测 `lib/modules/6.6-gki/` 里两份清单都有，`modules.load.recovery` 是 286 条，`modules.load` 只有 266 条，前者才是 MTK 给 recovery 准备的 |
+| `insmod` 报 `File exists` 记为 skip 而不是 fail | 大量模块在 vendor_boot 的 first stage 已内建或被依赖链带进来，全算 fail 会让日志失真 |
+| 失败只记前 8 个名字 | 286 条全打印会把 kmsg 冲掉，反而看不清 |
+| 用 `/system/bin/sh script` 而不是直接 `exec` 脚本 | cpio 打包时 `recovery/root` 里的文件可能丢可执行位，显式走解释器最稳（已确认 ramdisk 里 `system/bin/sh`、`toybox`、`insmod` 都在） |
+| 开头 `exec 1>/dev/kmsg` | init 的 `exec` 子进程一般继承 `/dev/kmsg`，但不同版本可能指到 `/dev/null`，显式重定向一次保证日志一定能看到 |
+| 结尾 `sleep 1` 再查节点 | ueventd 建 `/dev/graphics/fb0` 是异步的，立刻查会误报 MISSING |
+
 **为什么选 `on fs` 而不是 `late-init`**：TWRP 的服务挂在 `boot` 触发器上，而 `boot` 是在 `late-init` 段里 `trigger` 出来的，追加到 `late-init` 尾部容易和它抢顺序；`fs` 阶段（约 5.2 s）早于 `boot`（5.23 s），且 ueventd 已在 `early-init` 起来，模块注册时的 uevent 能立刻生成 `/dev/graphics/fb0`。
+
+### 21. first stage 一条模块都加载不了：清单路径与加载路径不是同一个
+
+**现场**（同一次 `console-ramoops`）：
+
+```
+init: alias lines in modules.alias must have 3 entries, not 5
+init: softdep lines in modules.softdep must have at least 4 entries
+init: module bootprof can't be loaded; can't access /lib/modules/bootprof.ko
+```
+
+注意只有**一条** `can't be loaded`：`LoadModulesFromFile()` 读到第一条文件不存在就整体返回失败，后面 265 条根本不再尝试。
+
+**根因**：init 读清单时用的是 `/lib/modules/6.6-gki/modules.load`（能读到，所以才会解析 alias/softdep 并报格式警告），但拼加载路径时用的是 `/lib/modules/<name>.ko`（不带 `6.6-gki`）。两边不一致，清单第一条 `bootprof.ko` 就找不到。
+
+**先确认是不是硬故障**：拆 `vendor_boot.img` 的 platform 片段，核对 `modules.dep` ——
+
+```
+清单 286 条，不在 dep 里的 0 条
+dep 里 f2fs*: []   ext4*: []   erofs*: []
+```
+
+`ext4` / `erofs` / `f2fs` 都不在 `modules.dep` 里，说明它们是 **builtin**。再对照 `fstab.mt6899`（system/system_ext/vendor/product/odm/*_dlkm 是 ext4/erofs，metadata/data 是 f2fs），first stage 挂载 logical 分区**不需要任何 vendor 模块**。所以这条报错是软故障：只丢 MTK 的崩溃转储与性能跟踪。
+
+**为什么不能「全平铺」**：303 个 `.ko` 共 **61 MB**，`vendor_boot` 分区 128 MB，当时产物已 87 MB（其中 61 MB 是 platform 与 recovery 两个 fragment 各存了一份）。全平铺会直接超限，`add_hash_footer` 报 image too large。
+
+**改法**：新增 `scripts/fix_first_stage_modules.py`，接在 `fix_device_vendor_boot.py` 之后（5.5 步）：
+
+1. 用 `modules.dep` 建依赖图，保留集 = 清单里的关键文件系统模块（`f2fs/ext4/erofs/squashfs`，仅在它们是模块时才保留）+ MTK 的 `bootprof/mrdump/aee_aed`，再取依赖闭包；
+2. 按原清单顺序重写 `modules.load`（依赖天然在前）；
+3. 把保留的 `.ko` **平铺复制**到 `lib/modules/` 根下，对上 init 拼的路径。
+
+实测这台机器保留 3 条、308 KB：`bootprof.ko mrdump.ko aee_aed.ko`。第二次运行输出「modules.load 已是最新 / 新复制 0」。
+
+| 坑 | 说明 |
+|---|---|
+| 不能把 `aee_rs.ko` 加进保留集 | 它在 `modules.dep` 里依赖整条显示栈（`mediatek-drm` / `vivo_display` / `mtk_sync` 等 46 个），一加就是 51 条、十几 MB |
+| 文件系统是模块的机型要保留依赖闭包 | 否则 `f2fs.ko` 找不到 `crc32.ko` / `xxhash.ko`，挂载失败 —— 脚本对这种情况会自动带上（已用假 dep 图验证顺序） |
+| `modules.load.recovery` 不能动 | 那是 second stage 给 TWRP 用的，`twrp-modules.sh` 按 `6.6-gki` 子目录加载 |
+| `modules.alias` / `modules.softdep` 的格式警告消不掉 | MTK 用 modprobe 风格生成（5~6 个字段），AOSP init 的解析器只认 3/4 个字段，会跳过这些行；recovery 不走 `modprobe`，无影响 |
 
 ## 四、怎么用
 
