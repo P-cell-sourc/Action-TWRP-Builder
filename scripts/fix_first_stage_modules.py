@@ -37,8 +37,9 @@ MTK 设备树把 vendor 模块放在 /lib/modules/<kver>/ 下（如 6.6-gki）�
 现有产物已 87 MB，全平铺会直接超限（add_hash_footer: image too large）。
 
 `modules.load.recovery` 必须一起处理 —— recovery 模式（cmdline 带 recoverymode=1）
-下 init 读的是它，不是 `modules.load`。原 286 条清单另存为 `modules.load.twrp`，
-交给 second stage 的 system/bin/twrp-modules.sh 按 6.6-gki 子目录全量加载。
+下 init 读的是它，不是 `modules.load`。原 286 条清单按 `modules.dep` **拓扑排序**后
+写成 `modules.load.twrp`（依赖在前），交给 second stage 的 system/bin/twrp-modules.sh
+按 6.6-gki 子目录加载；`fp_dispatch_event.ko` 在黑名单里（insmod 会 BUG 掉内核）。
 
 用法
 ----
@@ -60,6 +61,14 @@ FS_CRITICAL = ("f2fs.ko", "ext4.ko", "erofs.ko", "squashfs.ko")
 # 注意不要加 aee_rs.ko：它在 modules.dep 里依赖整条显示栈（mediatek-drm /
 # vivo_display / mtk_sync 等 46 个模块），会把 51 条、十几 MB 一起拖进来。
 KEEP_ALWAYS = ("bootprof.ko", "mrdump.ko", "aee_aed.ko")
+
+# second stage 绝不加载的模块：insmod 会直接把内核打死，且与显示/输入/USB 无关。
+#   fp_dispatch_event.ko —— vivo 指纹事件分发，init 里 BUG()：
+#     Internal error: BRK handler: 00000000f2000100 [#1] PREEMPT SMP
+#     pc : cleanup_module+0x152c4/0x153ac [fp_dispatch_event]
+#     lr : init_module+0x1a8/0xf18 [fp_dispatch_event]
+#     -> mrdump_common_die -> panic（整机重启，TWRP 永远起不来）
+BLACKLIST = ("fp_dispatch_event.ko",)
 
 
 def read_lines(p):
@@ -152,6 +161,62 @@ def render(kept, fs_builtin, src_dir):
     return "\n".join(lines) + "\n"
 
 
+def dep_order(names, deps, src_dir, blacklist=()):
+    """按 modules.dep 做拓扑排序，依赖一定排在前面。
+
+    vendor 给的 286 条清单**不是**加载顺序：实测 vivo_display.ko 在第 90 条，
+    而它依赖的 event_track.ko 排在第 267 条。按原顺序 insmod 的结果是：
+
+        vivo_display: Unknown symbol track_event (err -2)
+        panel_common: Unknown symbol lcm_sw_id / get_vivo_display / lcm_dev_register
+        mtk_mml:      Unknown symbol lcm_sw_id / get_vivo_display
+        mediatek_drm: Unknown symbol lcm_sw_id / get_vivo_display / mmprofile_log_ex
+
+    级联下来整条显示栈一条都没加载成功 —— 黑屏的真正原因。同理 mtk_iommu /
+    zcache / system_heap / vcp / dvfsrc 全是「依赖还没进内核就先加载」。
+
+    另外 modules.dep 里有些依赖项不在 286 条清单里（thp_pool / vivo_rsc /
+    event_track 之外的 slbc 等），但 .ko 就在目录中，一并按依赖顺序补进来。
+    """
+    blacklist = set(blacklist)
+    present = set(n for n in os.listdir(src_dir) if n.endswith(".ko"))
+    out, state = [], {}
+
+    def walk(m):
+        if m in blacklist:
+            return
+        st = state.get(m)
+        if st:
+            return            # done 或 visiting（成环，直接跳过）
+        state[m] = "visiting"
+        for d in deps.get(m, []):
+            if d in present:
+                walk(d)
+        state[m] = "done"
+        if m in present:
+            out.append(m)
+
+    for n in names:
+        walk(n)
+    return out
+
+
+def render_full(ordered, blacklist, src_dir):
+    lines = [
+        "# %s 由 twrp-builder 生成：second stage 的模块加载顺序。" % MARK,
+        "#",
+        "# 按 modules.dep 拓扑排序 —— 依赖在前，被依赖的在后。vendor 原始清单",
+        "# 顺序是错的（vivo_display 在 90、它依赖的 event_track 在 267），照原样",
+        "# insmod 会让整条显示栈因 Unknown symbol 全部失败（黑屏）。",
+        "#",
+        "# 已剔除（insmod 会 BUG/panic）: %s" % (" ".join(blacklist) or "(无)"),
+        "# 条目 %d，目录 %s" % (len(ordered), os.path.basename(src_dir)),
+    ]
+    lines.append("")
+    lines += ordered
+    return "\n".join(lines) + "\n"
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -208,12 +273,27 @@ def main():
     #   modules.load.recovery 自己写精简版，内容全是已平铺的 .ko。
     rload = os.path.join(src_dir, "modules.load.recovery")
     full = os.path.join(src_dir, "modules.load.twrp")
-    if os.path.isfile(rload):
-        if not os.path.isfile(full):
-            rn = len([l for l in read_lines(rload)
-                      if l.strip() and not l.strip().startswith("#")])
-            shutil.copy2(rload, full)
-            print("  ✓ 全量清单另存为 modules.load.twrp（%d 条，供 second stage）" % rn)
+    if os.path.isfile(rload) or os.path.isfile(full):
+        # 原始全量清单：第一次是 modules.load.recovery，之后是 modules.load.twrp
+        # （因为 rload 会被下面改写成精简版）
+        src_full = full if os.path.isfile(full) else rload
+        names = [l.strip() for l in read_lines(src_full)
+                 if l.strip() and not l.strip().startswith("#")]
+        ordered = dep_order(names, deps, src_dir, BLACKLIST)
+        dropped = [n for n in names if n in BLACKLIST]
+        extra = [n for n in ordered if n not in names]
+        want_full = render_full(ordered, BLACKLIST, src_dir)
+        cur_full = read_lines(full) if os.path.isfile(full) else None
+        if cur_full is not None and "\n".join(cur_full) + "\n" == want_full:
+            print("  modules.load.twrp 已是最新（%d 条，依赖已排序）" % len(ordered))
+        else:
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(want_full)
+            print("  ✓ 生成 modules.load.twrp（%d 条，按 modules.dep 拓扑排序）" % len(ordered))
+        if dropped:
+            print("  ✓ 黑名单剔除: %s" % " ".join(dropped))
+        if extra:
+            print("  ✓ 依赖补齐（清单未列但目录中有）: %s" % " ".join(extra[:10]))
         with open(rload, "r", encoding="utf-8", errors="replace") as f:
             rcur = f.read()
         if rcur != want:

@@ -646,6 +646,65 @@ init: Command 'exec - root root -- /system/bin/sh /system/bin/twrp-modules.sh'
 
 **为什么没有 `[twrp-fix]` 输出**：脚本压根没被执行，不是执行了没输出。先看 `on fs` 那条 `exec` 有没有报错，再看脚本自己的 log —— 这两步不能跳。
 
+### 24. 脚本终于跑起来了：清单顺序是错的 + 一个模块 insmod 直接把内核打死
+
+**现场**（`console-ramoops`，5.22 s → 9.58 s）：
+
+SELinux 那道关已经过了，exec 真的起来了：
+
+```
+5.218876 init: starting service 'exec 1 (/system/bin/sh /system/bin/twrp-modules.sh)'...
+5.220946 init: SVC_EXEC service 'exec 1 (...)' pid 202 (uid 0 gid 0+0 context u:r:recovery:s0) started; waiting...
+```
+
+加载随之开始，但模块一个接一个报 `Unknown symbol`：
+
+```
+5.476839 zcache:        Unknown symbol rsc_qos_enable / get_task_qos
+5.705587 mtk_iommu:     Unknown symbol mtk_smi_dbg_register_notifier / mtk_smi_dbg_hang_detect
+6.581737 mtk_mml:       Unknown symbol lcm_sw_id / get_vivo_display
+6.685988 vivo_display:  Unknown symbol track_event
+6.698209 panel_common:  Unknown symbol lcm_sw_id / lcm_dev_register
+6.865300 mediatek_drm:  Unknown symbol lcm_sw_id / mmprofile_log_ex / get_vivo_display / cmdq_*
+9.573562 Internal error: BRK handler: 00000000f2000100 [#1] PREEMPT SMP
+9.586938 pc : cleanup_module+0x152c4/0x153ac [fp_dispatch_event]
+9.586948 lr : init_module+0x1a8/0xf18 [fp_dispatch_event]
+```
+
+没有 `[twrp-fix]` 输出的原因很简单：脚本的统计只在**循环结束**时打，而循环没走完 —— 第 ~250 个模块 insmod 时内核就 panic 了。
+
+**两个独立问题**
+
+**① 清单顺序不是加载顺序。** vendor 那 286 条既不是拓扑序，也不完整：
+
+| 模块 | 清单位置 | 依赖 | 依赖在清单里的位置 |
+|---|---|---|---|
+| `vivo_display.ko` | 90 | `event_track.ko`（导出 `track_event`） | **267** |
+| `mediatek-drm.ko` | 103 | `mtk-mml.ko` / `cmdq-*` / `vivo_display.ko` | 82/86/90 |
+| `zcache.ko` | 18 | `vivo_rsc.ko`（导出 `rsc_qos_enable`） | **不在清单里** |
+| `system_heap.ko` | — | `thp_pool.ko`（导出 `thppool_*`） | **不在清单里** |
+
+`lcm_sw_id` / `get_vivo_display` / `lcm_dev_register` 三个符号的导出者都是 `vivo_display.ko`（`nm` 查 `__ksymtab_*` 确认）。它因为 `track_event` 没进来而加载失败，于是 `panel_common` / `mtk-mml` / `mediatek-drm` 全部级联失败 —— **整条显示栈零加载，这才是黑屏的直接原因**，跟 fb/DRM 后端无关。
+
+**② `fp_dispatch_event.ko` insmod 会 BUG。** 它是 vivo 指纹事件分发，`init_module` 里直接 `BUG()`（`BRK handler: f2000100`），走 `mrdump_common_die` → panic。与显示/输入/USB 无关，必须拉黑。
+
+**改法**
+
+`scripts/fix_first_stage_modules.py` 新增 1c 段，写 `modules.load.twrp` 之前：
+
+1. 解析 `modules.dep` 建图，按 **DFS 拓扑排序**输出（依赖一定在前）；
+2. 依赖闭包里「清单没列但目录里有」的模块一起补进来（`vivo_rsc` / `thp_pool` / `mtk_slbc`）；
+3. `BLACKLIST = ("fp_dispatch_event.ko",)` 剔除；
+4. 清单里重复的 `mtk_dramc.ko` 顺带去重。实测 286 条 → 287 条（-1 黑名单 -1 重复 +3 补齐），**顺序违例 0**。
+
+`twrp-modules.sh`（CI 的 `LOADER` 模板与设备树同步）：
+
+- 每个模块打一行 `[twrp-fix] [i/N] ok|skip|FAIL name`，崩溃时 rammops 最后一行就是元凶；
+- 运行期再兜一层黑名单（万一清单是旧的）；
+- 失败行截取 `insmod` 第一行错误，最多记 20 个。
+
+**教训**：`insmod` 一个依赖未满足的模块只会返回 `Unknown symbol`，脚本正确地把它记成失败继续往下走 —— 所以「脚本跑完了、ok 也不少」并不代表加载链完整。判据要看**关键模块是否成功**（`mediatek-drm` / `vivo_display` / `mtu3`），不是看总数。
+
 ## 四、怎么用
 
 二选一：
