@@ -162,6 +162,30 @@ exit 0
 
 STDIO_OPT = "    stdio_to_kmsg"
 
+# ── recovery 二进制缺失的间接依赖库 ────────────────────────────────────
+# 实测（解包 vendor_boot.img 后对 /system/bin/recovery 做依赖闭包分析）：
+#   recovery -> android.security.maintenance-ndk.so
+#            -> android.system.keystore2-V4-ndk.so        ← 不在 ramdisk
+#   recovery -> libtar.so -> libkeystore-attestation-application-id.so
+#            -> android.security.aaid_aidl-cpp.so        ← 不在 ramdisk
+# linker 在 __linker_init 阶段递归加载 DT_NEEDED，缺一个就 exit(1)：
+# 进程只活 4~8ms、没有任何 stdout/stderr，屏幕停在 bootloader 画的 logo。
+# TARGET_RECOVERY_DEVICE_MODULES 只保证"被构建"（实测装到了 system/lib64），
+# 不会进 recovery/root；必须挂到 recovery 模块的 LOCAL_SHARED_LIBRARIES，
+# 让 Soong 用 recovery variant 装进 $(TARGET_RECOVERY_ROOT_OUT)/system/lib64。
+LIBS_MARK = "[twrp-builder-fix] recovery 运行期缺失的间接依赖库"
+LIBS_BLOCK = """
+# @@MARK@@
+#   recovery -> android.security.maintenance-ndk.so -> android.system.keystore2-V4-ndk.so
+#   recovery -> libtar.so -> libkeystore-attestation-application-id.so
+#                        -> android.security.aaid_aidl-cpp.so
+#   两者都不在 recovery ramdisk 里，linker 会直接 exit(1)（无任何输出）。
+#   LOCAL_SHARED_LIBRARIES 才能让 Soong 按 recovery variant 装到 recovery/root。
+LOCAL_SHARED_LIBRARIES += \\
+    android.security.aaid_aidl-cpp \\
+    android.system.keystore2-V4-ndk
+""".replace("@@MARK@@", LIBS_MARK)
+
 
 def read(p):
     with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -242,6 +266,33 @@ def patch_service_rc(source_root):
     return True
 
 
+def patch_recovery_libs(source_root):
+    """给 recovery 模块挂上缺失的间接依赖，让它们随 recovery variant 装进 ramdisk"""
+    p = os.path.join(source_root, "bootable", "recovery", "Android.mk")
+    if not os.path.isfile(p):
+        print("  ! 找不到 %s" % p)
+        return False
+    s = read(p)
+    if LIBS_MARK in s:
+        print("  %s 已含缺失依赖段" % p)
+        return True
+
+    # 定位 recovery 模块：LOCAL_MODULE := recovery → 其后第一个 BUILD_EXECUTABLE
+    m = re.search(r"^LOCAL_MODULE\s*:=\s*recovery\s*$", s, re.M)
+    if not m:
+        print("  ! %s 里没有 LOCAL_MODULE := recovery" % p)
+        return False
+    m2 = re.search(r"^include \$\(BUILD_EXECUTABLE\)", s[m.end():], re.M)
+    if not m2:
+        print("  ! recovery 模块后没有 include $(BUILD_EXECUTABLE)")
+        return False
+    at = m.end() + m2.start()
+    new = s[:at] + LIBS_BLOCK + s[at:]
+    write(p, new)
+    print("  ✓ %s：recovery 补上 aaid_aidl-cpp / keystore2-V4-ndk" % p)
+    return True
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -258,6 +309,7 @@ def main():
         print("  ! 设备树里没有 recovery/root，脚本仍会写入，但可能不生效")
     patch_init_rc(source_root)
     patch_service_rc(source_root)
+    patch_recovery_libs(source_root)
     print("== 完成 ==")
     return 0
 
