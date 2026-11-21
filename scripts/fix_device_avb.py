@@ -41,8 +41,23 @@ AOSP 14 的 soong 在解析 Android.bp 阶段会跑 build/soong/fsgen，
     build/make/core/Makefile:4815: error:
       BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX is not defined.
 
-幂等：缺什么补什么，全部齐了就不动文件；找不到 BoardConfig 或没有
-chained 分区时静默退出。
+另外，fsgen 还会校验 rollback index location 的取值：
+
+    error: build/soong/fsgen/Android.bp:32:1:
+      module "..._generated_vbmeta_image" variant "android_common"
+      (created by module "soong_filesystem_creator" variant "android_common"):
+      chained_partitions: rollback index location must be 1, 2, 3, ...
+
+也就是说写成 0 是非法值（0 常用于「不启用回滚保护」的语义，但 fsgen
+不接受）。设备树里已经写了 `:= 0` 时，"补缺失"逻辑会因为
+var_defined() 判定为已定义而跳过，所以这里额外做一次纠正：
+把所有 `_ROLLBACK_INDEX_LOCATION := 0` 改写成未被占用的正整数。
+
+注意不要和 `_ROLLBACK_INDEX`（无 LOCATION 后缀，时间戳语义）混淆，
+那个写 0 是合法的，不动。
+
+幂等：缺什么补什么，0 改成正数；全部合规就不动文件；找不到 BoardConfig
+或没有 chained 分区时静默退出。
 """
 
 import os
@@ -69,6 +84,13 @@ SKIP_SUFFIX = (
     "_PARTITION_SIZE",
 )
 
+# BOARD_AVB_<X>_ROLLBACK_INDEX_LOCATION := 0  —— 0 是非法值，fsgen 要求 1,2,3,...
+# 末尾允许带注释，替换时保留
+LOCATION_ZERO_RE = re.compile(
+    r"^([ \t]*)(BOARD_AVB_[A-Z0-9_]+_ROLLBACK_INDEX_LOCATION)([ \t]*[:+]?=[ \t]*)0([ \t]*(?:#.*)?)$",
+    re.M,
+)
+
 
 def var_defined(text: str, name: str) -> bool:
     """判断 makefile 里是否给某个变量赋过值（= := ?= += 均可）。"""
@@ -91,6 +113,33 @@ def collect_board_configs(root: Path):
     if not main.is_file():
         main = files[0]
     return main, files
+
+
+def fix_zero_locations(files, used):
+    """把 _ROLLBACK_INDEX_LOCATION := 0 改写成未被占用的正整数。
+
+    fsgen 对 chained_partitions 的校验是 `location <= 0` 就报
+    "must be 1, 2, 3, ..."，所以 0 必须换掉；同时整机范围内不能撞号，
+    从 used 里找最小的空闲编号。
+
+    返回 [(文件名, 变量名, 新编号), ...]
+    """
+    changed = []
+    for f in files:
+        text = f.read_text(encoding="utf-8", errors="surrogateescape")
+
+        def repl(m):
+            n = 1
+            while n in used:
+                n += 1
+            used.add(n)
+            changed.append((f.name, m.group(2), n))
+            return "%s%s%s%d%s" % (m.group(1), m.group(2), m.group(3), n, m.group(4))
+
+        new = LOCATION_ZERO_RE.sub(repl, text)
+        if new != text:
+            f.write_text(new, encoding="utf-8", errors="surrogateescape")
+    return changed
 
 
 def process_tree(tree: Path) -> int:
@@ -119,10 +168,19 @@ def process_tree(tree: Path) -> int:
     key = get_var(combined, "BOARD_AVB_VENDOR_BOOT_KEY_PATH") or DEFAULT_KEY
     algorithm = get_var(combined, "BOARD_AVB_VENDOR_BOOT_ALGORITHM") or DEFAULT_ALGORITHM
 
-    # rollback index location 必须在整机范围内唯一，先收集已被占用的编号
+    # rollback index location 必须在整机范围内唯一，先收集已被占用的编号。
+    # 0 是非法值（fsgen 要求 1,2,3,...），不占编号，留给 fix_zero_locations 重分配。
     used_locations = set()
     for m in re.finditer(r"^\s*BOARD_AVB_[A-Z0-9_]+_ROLLBACK_INDEX_LOCATION\s*[:+]?=\s*(\d+)", combined, re.M):
-        used_locations.add(int(m.group(1)))
+        v = int(m.group(1))
+        if v > 0:
+            used_locations.add(v)
+
+    # 已经写成 0 的，就地纠正成正整数（否则 soong bootstrap 阶段报
+    # "chained_partitions: rollback index location must be 1, 2, 3, ..."）
+    zero_fixed = fix_zero_locations(files, used_locations)
+    for fname, var, new_loc in zero_fixed:
+        print("设备树 AVB：%s 的 %s 由 0 改为 %d" % (fname, var, new_loc))
 
     def next_location():
         n = 1
@@ -153,7 +211,8 @@ def process_tree(tree: Path) -> int:
         added.append(name)
 
     if not blocks:
-        print("设备树 AVB：%s 的 chained 分区配置完整，无需修改" % tree)
+        if not zero_fixed:
+            print("设备树 AVB：%s 的 chained 分区配置完整，无需修改" % tree)
         return 0
 
     text = main.read_text(encoding="utf-8", errors="surrogateescape")
@@ -182,3 +241,4 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+
