@@ -856,6 +856,33 @@ jobs:
         exit "$RC"
 
     # ──────────────────────────────────────────────────────────────
+    # 6.5 补 ramdisk 里缺失的间接依赖 .so
+    #   Soong 不会给 "只被间接需要" 的库生成 recovery variant，实测两条路
+    #   （TARGET_RECOVERY_DEVICE_MODULES / LOCAL_SHARED_LIBRARIES）都只把它们
+    #   装进 $OUT/system/lib64。缺库时 linker 在 __linker_init 就 exit(1)，
+    #   进程活 4~8ms、无任何输出，屏幕上只有 bootloader 的 logo。
+    #   这里在镜像出炉后直接把它塞进 recovery 分片的 cpio（无损、不改变尺寸）。
+    # ──────────────────────────────────────────────────────────────
+    - name: Complete recovery ramdisk deps
+      if: success()
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      run: |
+        set -uo pipefail
+        OUT="${{ steps.build.outputs.product_out }}"
+        IMG="$OUT/vendor_boot.img"
+        if [ ! -f "$IMG" ]; then
+          echo "::notice::没有 vendor_boot.img（本次目标是 boot/recovery），跳过依赖补齐"
+          exit 0
+        fi
+        python3 -c "import lz4.block" 2>/dev/null \
+          || pip3 install --no-input -q --break-system-packages lz4 \
+          || python3 -m pip install --no-input -q lz4 || true
+
+        LIBS="$OUT/system/lib64,$OUT/system/lib64/vndk-sp,$OUT/system/lib64/vndk-33,$OUT/vendor/lib64"
+        python3 "$GITHUB_WORKSPACE/scripts/fix_vendor_boot_libs.py" "$IMG" --libs "$LIBS" \
+          || echo "::warning::ramdisk 依赖补齐失败，产物仍可刷，但 recovery 可能仍起不来"
+
+    # ──────────────────────────────────────────────────────────────
     # 7. 失败取证
     # ──────────────────────────────────────────────────────────────
     - name: Diagnose unexpected termination
