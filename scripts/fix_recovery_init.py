@@ -162,6 +162,25 @@ exit 0
 
 STDIO_OPT = "    stdio_to_kmsg"
 
+# ── recovery 启动包装 ──────────────────────────────────────────────────
+# recovery 服务原本直接 exec /system/bin/recovery。一旦进程在 main() 之前就死
+# （动态链接器缺库、ABI 不匹配、被 seccomp 拦），stderr 里那句真正的原因经常
+# 看不到，ramoops 里只剩 "Service 'recovery' exited with status 1"。
+# 这里套一层 sh：先把 stdout/stderr 钉到 /dev/kmsg，再 exec 真正的二进制，
+# 退出后把 rc 也写进 kmsg。代价是多一个 sh 父进程，TWRP 不依赖 getppid()。
+BOOT_SH = r"""#!/system/bin/sh
+# @@MARK@@ TWRP 启动包装：把链接/启动失败的原因留在 kmsg 里
+[ -e /dev/kmsg ] && exec 1>/dev/kmsg 2>&1
+echo "[twrp-boot] launch /system/bin/recovery"
+/system/bin/recovery
+RC=$?
+echo "[twrp-boot] recovery exited rc=$RC"
+exit $RC
+""".replace("@@MARK@@", MARK)
+
+SERVICE_OLD = "service recovery /system/bin/recovery"
+SERVICE_NEW = "service recovery /system/bin/sh /system/bin/twrp-boot.sh"
+
 # ── recovery 二进制缺失的间接依赖库 ────────────────────────────────────
 # 实测（解包 vendor_boot.img 后对 /system/bin/recovery 做依赖闭包分析）：
 #   recovery -> android.security.maintenance-ndk.so
@@ -266,6 +285,48 @@ def patch_service_rc(source_root):
     return True
 
 
+def patch_boot_wrapper(source_root, device_path):
+    """把 recovery 启动包装脚本放进设备树 recovery/root/system/bin/"""
+    rec_root = os.path.join(source_root, device_path, "recovery", "root")
+    dst = os.path.join(rec_root, "system", "bin", "twrp-boot.sh")
+    old = read(dst) if os.path.isfile(dst) else None
+    if old == BOOT_SH:
+        print("  %s 已是最新" % dst)
+    else:
+        write(dst, BOOT_SH, 0o755)
+        print("  ✓ 写入 %s" % dst)
+    os.chmod(dst, 0o755)
+    return os.path.isfile(dst)
+
+
+def patch_service_cmd(source_root, have_wrapper):
+    """service recovery 改为经 twrp-boot.sh 启动（只在包装脚本确实存在时才改）"""
+    cand = [
+        os.path.join(source_root, "bootable", "recovery", "etc",
+                     "init.recovery.service22.rc"),
+        os.path.join(source_root, "bootable", "recovery", "etc",
+                     "init.recovery.service.rc"),
+    ]
+    p = next((c for c in cand if os.path.isfile(c)), None)
+    if not p:
+        print("  ! 没有找到 init.recovery.service*.rc，跳过启动包装")
+        return False
+    if not have_wrapper:
+        print("  ! 包装脚本没写成功，保持直接启动 /system/bin/recovery")
+        return False
+    s = read(p)
+    if SERVICE_NEW in s:
+        print("  %s 已改为经 twrp-boot.sh 启动" % p)
+        return True
+    if SERVICE_OLD not in s:
+        print("  ! %s 里没有 '%s'，跳过启动包装" % (p, SERVICE_OLD))
+        return False
+    s = s.replace(SERVICE_OLD, SERVICE_NEW)
+    write(p, s)
+    print("  ✓ %s：service recovery 改为 sh 启动包装（日志进 kmsg）" % p)
+    return True
+
+
 def patch_recovery_libs(source_root):
     """给 recovery 模块挂上缺失的间接依赖，让它们随 recovery variant 装进 ramdisk"""
     p = os.path.join(source_root, "bootable", "recovery", "Android.mk")
@@ -309,6 +370,8 @@ def main():
         print("  ! 设备树里没有 recovery/root，脚本仍会写入，但可能不生效")
     patch_init_rc(source_root)
     patch_service_rc(source_root)
+    have_wrapper = patch_boot_wrapper(source_root, device_path)
+    patch_service_cmd(source_root, have_wrapper)
     patch_recovery_libs(source_root)
     print("== 完成 ==")
     return 0
