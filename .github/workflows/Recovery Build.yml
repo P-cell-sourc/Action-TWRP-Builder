@@ -16,11 +16,11 @@ on:
       MANIFEST_URL:
         description: 'MANIFEST_URL（用 SSH 就填 git@github.com:XXX）'
         required: true
-        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
+        default: 'https://github.com/TWRP-Test/platform_manifest_twrp_aosp'
       MANIFEST_BRANCH:
         description: 'MANIFEST_BRANCH'
         required: true
-        default: 'twrp-14.1'
+        default: 'twrp-16.0'
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
