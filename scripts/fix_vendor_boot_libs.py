@@ -43,38 +43,70 @@ BLOCK = 8 * 1024 * 1024
 
 
 # ---------------------------------------------------------------- lz4 legacy
+# 优先用 python-lz4（快）；CI 里没装时退回系统 lz4 CLI（Android 构建机一定装了）。
+def _have_py_lz4():
+    try:
+        import lz4.block  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _have_cli_lz4():
+    from shutil import which
+    return which('lz4') is not None
+
+
 def lz4_legacy_decompress(buf):
-    import lz4.block
-    out = bytearray()
-    p, n = 0, len(buf)
-    while p + 4 <= n:
-        if struct.unpack_from('<I', buf, p)[0] != MAGIC_LZ4:
-            break
-        p += 4
+    if _have_py_lz4():
+        import lz4.block
+        out = bytearray()
+        p, n = 0, len(buf)
         while p + 4 <= n:
-            sz, = struct.unpack_from('<I', buf, p)
+            if struct.unpack_from('<I', buf, p)[0] != MAGIC_LZ4:
+                break
             p += 4
-            if sz == 0:
+            while p + 4 <= n:
+                sz, = struct.unpack_from('<I', buf, p)
+                p += 4
+                if sz == 0:
+                    break
+                out += lz4.block.decompress(buf[p:p + sz], uncompressed_size=BLOCK + 64)
+                p += sz
+                if p + 4 <= n and struct.unpack_from('<I', buf, p)[0] == MAGIC_LZ4:
+                    break
+            if p + 4 > n or struct.unpack_from('<I', buf, p)[0] != MAGIC_LZ4:
                 break
-            out += lz4.block.decompress(buf[p:p + sz], uncompressed_size=BLOCK + 64)
-            p += sz
-            if p + 4 <= n and struct.unpack_from('<I', buf, p)[0] == MAGIC_LZ4:
-                break
-        if p + 4 > n or struct.unpack_from('<I', buf, p)[0] != MAGIC_LZ4:
-            break
-    return bytes(out)
+        return bytes(out)
+
+    import subprocess
+    # lz4 CLI 能直接吃 legacy frame
+    p = subprocess.run(['lz4', '-d', '-c'], input=buf, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError('lz4 -d 失败: %s' % p.stderr.decode('utf-8', 'replace')[:200])
+    return p.stdout
 
 
 def lz4_legacy_compress(data):
-    import lz4.block
-    out = bytearray()
-    out += struct.pack('<I', MAGIC_LZ4)
-    for i in range(0, len(data), BLOCK):
-        comp = lz4.block.compress(data[i:i + BLOCK], store_size=False,
-                                  mode='high_compression', compression=12)
-        out += struct.pack('<I', len(comp))
-        out += comp
-    return bytes(out)
+    if _have_py_lz4():
+        import lz4.block
+        out = bytearray()
+        out += struct.pack('<I', MAGIC_LZ4)
+        for i in range(0, len(data), BLOCK):
+            comp = lz4.block.compress(data[i:i + BLOCK], store_size=False,
+                                      mode='high_compression', compression=12)
+            out += struct.pack('<I', len(comp))
+            out += comp
+        return bytes(out)
+
+    import subprocess
+    # -l legacy frame / -12 HC / -B7 4MB 块（CLI 最大块）
+    p = subprocess.run(['lz4', '-l', '-12', '-B7', '-c'], input=data,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError('lz4 -l 失败: %s' % p.stderr.decode('utf-8', 'replace')[:200])
+    return p.stdout
 
 
 # --------------------------------------------------------------------- cpio
