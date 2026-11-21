@@ -465,11 +465,11 @@ jobs:
         MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
         FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
         echo "内存 ${MEM_GB}GB / 根分区可用 ${FREE_GB}GB"
-        WANT=12
-        MAX=$(( FREE_GB - 16 ))
+        WANT=24
+        MAX=$(( FREE_GB - 28 ))
         SIZE=$(( WANT < MAX ? WANT : MAX ))
         if [ "$SIZE" -lt 2 ]; then
-          echo "::warning::可用磁盘 ${FREE_GB}GB 偏小（out/ 至少要留 16GB），跳过 swap"
+          echo "::warning::可用磁盘 ${FREE_GB}GB 偏小（out/ 至少要留 28GB），跳过 swap"
           exit 0
         fi
         [ "$SIZE" -lt "$WANT" ] && echo "::notice::磁盘偏紧，swap 降为 ${SIZE}GB"
@@ -482,7 +482,11 @@ jobs:
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile >/dev/null
         sudo swapon /swapfile
-        sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
+        # 编译场景的取舍：宁可换出冷页慢慢跑完，也不要被内核 OOM 杀掉。
+        # 60 太保守，内存触顶时内核还在犹豫，直接进 OOM killer。
+        sudo sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
+        sudo sysctl -w vm.vfs_cache_pressure=200 >/dev/null 2>&1 || true
+        sudo sysctl -w vm.watermark_scale_factor=200 >/dev/null 2>&1 || true
         free -h
         df -h /
 
@@ -740,11 +744,19 @@ jobs:
         fi
         echo "并行度：make -j${JOBS}"
 
-        # soong_build 是 Go 程序，给个软上限让它多做 GC，而不是被内核 OOM
+        # soong_build 是 Go 程序，给个软上限让它多做 GC，而不是被内核 OOM。
+        # GOMEMLIMIT 必须按「物理 + swap」算：实测 soong_build 的 anon-rss
+        # 会涨到 13.6GB，只按 MemTotal 算出来的 10.5GiB 拦不住它。
+        SWAP_GB=$(awk '/SwapTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
+        TOTAL_GB=$(( MEM_GB + SWAP_GB ))
         if [ -z "${GOMEMLIMIT:-}" ]; then
-          export GOMEMLIMIT=$(( MEM_GB * 70 / 100 ))GiB
+          export GOMEMLIMIT=$(( TOTAL_GB * 55 / 100 ))GiB
         fi
-        export GOGC="${GOGC:-80}"
+        export GOGC="${GOGC:-50}"
+        # recovery 用不到 dexpreopt，但 soong 要为每个 java 模块准备配置，
+        # 这是 analysis 阶段内存的一个大头；关掉不影响产物。
+        export WITH_DEXPREOPT=false
+        export DISABLE_DEXPREOPT=true
         echo "GOMEMLIMIT=$GOMEMLIMIT GOGC=$GOGC"
         echo "（这两个变量靠 scripts/patch_soong_memlimit.py 透传给 soong_build）"
 
