@@ -1010,10 +1010,10 @@ jobs:
         echo "交付镜像数：$kept"
 
         # ── 生成关闭校验的 vbmeta ──
-        # BoardConfig 里 BOARD_AVB_ENABLE 已置 false，vendor_boot 不带签名 footer；
-        # 但原厂 vbmeta 分区里仍留着 vendor_boot 的 hash descriptor，bootloader
-        # 照样校验并拒绝启动。这里生成一个 flags=3 的空 vbmeta，刷机时一起刷，
-        # 让 bootloader 跳过 hashtree 与 verification 两项校验。
+        # vendor_boot 由 AOSP testkey 签名（BOARD_AVB_ENABLE=true，带 footer，结构合法），
+        # 但原厂 vbmeta 分区里记录的是原厂 hash，bootloader 比对失败会拒绝启动。
+        # 这里生成 flags=3（hashtree + verification 都关）的 vbmeta，刷机时一起刷，
+        # bootloader 就会跳过校验。
         if [ ! -f dist/vbmeta.img ]; then
           if [ -f external/avb/avbtool ]; then
             if python3 external/avb/avbtool make_vbmeta_image --flags 3 \
