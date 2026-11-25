@@ -1009,6 +1009,24 @@ jobs:
         echo "dist=dist" >> "$GITHUB_OUTPUT"
         echo "交付镜像数：$kept"
 
+        # ── 生成关闭校验的 vbmeta ──
+        # BoardConfig 里 BOARD_AVB_ENABLE 已置 false，vendor_boot 不带签名 footer；
+        # 但原厂 vbmeta 分区里仍留着 vendor_boot 的 hash descriptor，bootloader
+        # 照样校验并拒绝启动。这里生成一个 flags=3 的空 vbmeta，刷机时一起刷，
+        # 让 bootloader 跳过 hashtree 与 verification 两项校验。
+        if [ ! -f dist/vbmeta.img ]; then
+          if [ -f external/avb/avbtool ]; then
+            if python3 external/avb/avbtool make_vbmeta_image --flags 3 \
+                 --padding_size 4096 --output dist/vbmeta.img >/dev/null 2>&1; then
+              echo "::notice::已生成 vbmeta.img（flags=3，关闭 hashtree + verification），刷 vendor_boot 时必须一起刷"
+            else
+              echo "::warning::vbmeta 生成失败，刷机时改用 fastboot --disable-verity --disable-verification flash vbmeta"
+            fi
+          else
+            echo "::warning::找不到 external/avb/avbtool，跳过 vbmeta 生成"
+          fi
+        fi
+
         echo "===== 交付目录 dist/ ====="
         ls -lh dist/ 2>/dev/null || true
         if [ "$kept" -eq 0 ]; then
